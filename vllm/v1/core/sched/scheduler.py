@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.sawtooth import is_sawtooth_enabled
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
@@ -68,6 +69,7 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.sawtooth import SawtoothRequestLedger
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -89,6 +91,16 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        self.sawtooth_enabled = is_sawtooth_enabled(vllm_config)
+        # The engine supplies the number of free logical-batch slots before
+        # admission. Direct scheduler callers retain ordinary batch sizing.
+        self.sawtooth_available_batches = 1
+        self.sawtooth_allow_early_admission = False
+        self.sawtooth_decode_only = False
+        self.sawtooth_prefill_only = False
+        # Match V2's fixed prefill_len, including output replay after preemption.
+        self._sawtooth_prefill_lens: dict[str, int] = {}
+        self.sawtooth_request_ledger = SawtoothRequestLedger()
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -558,7 +570,147 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def sawtooth_can_schedule(self, request: Request) -> bool:
+        if not request.num_in_flight_tokens:
+            return True
+        return bool(
+            self.sawtooth_allow_early_admission
+            and not request.is_finished()
+            and not request.use_structured_output
+            and not request.resumable
+            and self.sawtooth_request_ledger.can_advance(request.request_id)
+        )
+
+    def sawtooth_mark_tail_enqueued(self, output: SchedulerOutput) -> None:
+        for step in (output.sawtooth_request_steps or {}).values():
+            self.sawtooth_request_ledger.mark_tail_enqueued(step)
+
+    def _sawtooth_running_tokens(self, request: Request, step: int) -> int:
+        """Pure admission guards shared by lookahead and actual scheduling.
+
+        KV/encoder allocation and waiting-status promotion remain exclusively
+        in schedule(); a positive result is a candidate, not a resource promise.
+        """
+        if (
+            self._pause_state == PauseState.PAUSED_ALL
+            or request.is_finished()
+            or not self.sawtooth_can_schedule(request)
+            or step < request.next_decode_eligible_step
+            or request.num_computed_tokens
+            >= self.max_model_len - self.num_sampled_tokens_per_step
+            or (
+                request.num_output_placeholders > 0
+                and request.num_computed_tokens + 2 - request.num_output_placeholders
+                >= request.num_prompt_tokens + request.max_tokens
+            )
+        ):
+            return 0
+        return max(
+            0,
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens,
+        )
+
+    def _sawtooth_is_decode(self, request: Request, num_tokens: int) -> bool:
+        # The fallback supports old direct fixtures. Real V2 admissions always
+        # snapshot the worker boundary in _update_after_schedule below.
+        prefill_len = self._sawtooth_prefill_lens.get(
+            request.request_id, request.num_prompt_tokens
+        )
+        return num_tokens == 1 and request.num_computed_tokens >= prefill_len
+
+    def sawtooth_has_decode_candidate(self) -> bool:
+        """Read-only hint for the next schedule call, never allocate or promote."""
+        return self.sawtooth_enabled and any(
+            self._sawtooth_is_decode(
+                request, self._sawtooth_running_tokens(request, self.current_step + 1)
+            )
+            for request in self.running
+        )
+
+    def sawtooth_has_prefill_candidate(self) -> bool:
+        """A waiting P may still be blocked; one native admission may try it."""
+        if not self.sawtooth_enabled:
+            return False
+        if self._pause_state == PauseState.PAUSED_ALL:
+            return False
+        if self._pause_state == PauseState.UNPAUSED and (
+            self.waiting or self.skipped_waiting
+        ):
+            return True
+        for request in self.running:
+            count = self._sawtooth_running_tokens(request, self.current_step + 1)
+            if count and not self._sawtooth_is_decode(request, count):
+                return True
+        return False
+
+    def _sawtooth_request_cap(self, defer_prefills: bool) -> int:
+        """Leave independent requests for the other free pipeline slots.
+
+        Count only waiting requests that can fit in the remaining request
+        capacity. An arbitrarily large backlog must not turn a full running
+        set back into one batch. This is a request cap, not a token cap: long
+        prefill chunks retain the configured token budget.
+        """
+        slots = self.sawtooth_available_batches
+        if not self.sawtooth_enabled or (
+            slots <= 1 and not (self.sawtooth_decode_only or self.sawtooth_prefill_only)
+        ):
+            return self.max_num_running_reqs
+
+        eligible = 0
+        for request in self.running:
+            count = self._sawtooth_running_tokens(request, self.current_step)
+            if not count or (defer_prefills and request.is_prefill_chunk):
+                continue
+            is_decode = self._sawtooth_is_decode(request, count)
+            if (self.sawtooth_decode_only and not is_decode) or (
+                self.sawtooth_prefill_only and is_decode
+            ):
+                continue
+            eligible += 1
+
+        waiting_capacity = max(
+            0,
+            self.max_num_running_reqs
+            - len(self.running)
+            - self.num_waiting_for_streaming_input,
+        )
+        for queue in (self.skipped_waiting, self.waiting):
+            if self.sawtooth_decode_only or waiting_capacity == 0:
+                break
+            for request in queue:
+                if waiting_capacity == 0:
+                    break
+                if (
+                    request.status
+                    not in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                    or request.num_in_flight_tokens
+                    or (
+                        request.num_stale_output_tokens > 0
+                        and not request.drop_stale_output
+                    )
+                    or (
+                        defer_prefills
+                        and request.num_computed_tokens < request.num_tokens - 1
+                    )
+                ):
+                    continue
+                eligible += 1
+                waiting_capacity -= 1
+
+        # A blocked waiter can become ready during the regular admission loop.
+        # Keep that opportunity even when the initial estimate was zero.
+        slots = max(1, slots)
+        return max(1, (eligible + slots - 1) // slots)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        if self.sawtooth_decode_only or self.sawtooth_prefill_only:
+            if not self.sawtooth_enabled:
+                raise ValueError("Sawtooth selection requires sawtooth scheduling")
+            if self.sawtooth_decode_only and self.sawtooth_prefill_only:
+                raise ValueError("Sawtooth decode-only and prefill-only are exclusive")
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -606,16 +758,37 @@ class Scheduler(SchedulerInterface):
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
+        if self.sawtooth_enabled and (
+            self.sawtooth_decode_only or self.sawtooth_prefill_only
+        ):
+            # A bounded explicit opportunity is independent of DP throttling.
+            defer_prefills = False
+        request_cap = self._sawtooth_request_cap(defer_prefills)
 
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
+            if len(num_scheduled_tokens) >= request_cap:
+                break
             request = self.running[req_index]
+            if self.sawtooth_enabled:
+                candidate_tokens = self._sawtooth_running_tokens(
+                    request, self.current_step
+                )
+                is_decode = self._sawtooth_is_decode(request, candidate_tokens)
+                if (
+                    not candidate_tokens
+                    or (self.sawtooth_decode_only and not is_decode)
+                    or (self.sawtooth_prefill_only and is_decode)
+                ):
+                    req_index += 1
+                    continue
             if input_budget <= draft_slots:
                 break
 
             if (
-                request.num_output_placeholders > 0
+                not self.sawtooth_enabled
+                and request.num_output_placeholders > 0
                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
                 # Since output placeholders are also included in the computed tokens
                 # count, we subtract (num_output_placeholders - 1) to remove any draft
@@ -630,7 +803,10 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            if self.current_step < request.next_decode_eligible_step:
+            if (
+                not self.sawtooth_enabled
+                and self.current_step < request.next_decode_eligible_step
+            ):
                 # V2+PP+async: enforce `pp_size` steps between same-req decodes
                 # to match worker-side sampled-tokens broadcast slot ring cadence.
                 req_index += 1
@@ -730,6 +906,7 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        delay_cache_blocks=self.sawtooth_enabled,
                     )
 
                     if new_blocks is not None:
@@ -744,19 +921,29 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
+                    preemptible = self.running
+                    if self.sawtooth_enabled:
+                        preemptible = [
+                            r for r in self.running if not r.num_in_flight_tokens
+                        ]
+                        if not preemptible:
+                            break
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
-                            self.running,
+                            preemptible,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
                     else:
-                        preempted_req = self.running[-1]
+                        preempted_req = preemptible[-1]
 
                     # A deferred free will not help with immediate allocation.
                     if not self._request_blocks_can_be_freed(preempted_req):
                         break
 
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    if (
+                        self.policy == SchedulingPolicy.PRIORITY
+                        or self.sawtooth_enabled
+                    ):
                         victim_index = self.running.index(preempted_req)
                         del self.running[victim_index]
                         if victim_index < req_index:
@@ -852,10 +1039,16 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        if (
+            not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and not (self.sawtooth_enabled and self.sawtooth_decode_only)
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
+                if len(num_scheduled_tokens) >= request_cap:
+                    break
                 if input_budget <= draft_slots:
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
@@ -1163,7 +1356,7 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
+                    delay_cache_blocks=load_kv_async or self.sawtooth_enabled,
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
@@ -1490,6 +1683,10 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if self.sawtooth_enabled and request.num_in_flight_tokens:
+            raise RuntimeError("Cannot preempt a live virtual pipeline step")
+        if self.sawtooth_enabled:
+            self.sawtooth_request_ledger.forget(request.request_id)
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -1528,6 +1725,27 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        if self.sawtooth_enabled:
+            for data in scheduler_output.scheduled_new_reqs:
+                assert data.prefill_token_ids is not None
+                self._sawtooth_prefill_lens[data.req_id] = len(data.prefill_token_ids)
+            # Snapshot before advancing optimistic counters. The bool is copied
+            # unchanged with every virtual-round SchedulerOutput replacement.
+            scheduler_output.sawtooth_has_decode = any(
+                self._sawtooth_is_decode(self.requests[rid], count)
+                for rid, count in num_scheduled_tokens.items()
+            )
+            scheduler_output.sawtooth_request_steps = {
+                rid: self.sawtooth_request_ledger.admit(
+                    rid,
+                    self.requests[rid].num_computed_tokens,
+                    count,
+                    self.requests[rid].num_computed_tokens + count
+                    >= self.requests[rid].num_tokens
+                    + self.requests[rid].num_output_placeholders,
+                )
+                for rid, count in num_scheduled_tokens.items()
+            }
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
@@ -1544,6 +1762,12 @@ class Scheduler(SchedulerInterface):
             # Drop from the in-flight-prefill set once it's no longer prefilling.
             if not request.is_prefill_chunk:
                 self._inflight_prefills.discard(request)
+
+        if self.sawtooth_enabled:
+            scheduler_output.sawtooth_token_ends = {
+                rid: self.requests[rid].num_computed_tokens
+                for rid in num_scheduled_tokens
+            }
 
         # Snapshot block IDs for routed experts before forward starts.
         # A concurrent schedule() may preempt requests and free blocks
@@ -1575,6 +1799,11 @@ class Scheduler(SchedulerInterface):
 
         Discards the last sampled output token from the prior input chunk.
         """
+
+        if self.sawtooth_enabled:
+            # Resumable input stays terminal-gated. A new worker request-state
+            # allocation must receive a new generation, even for the same ID.
+            self.sawtooth_request_ledger.forget(session.request_id)
 
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
@@ -1946,7 +2175,23 @@ class Scheduler(SchedulerInterface):
             request = self.requests.get(req_id)
             output_is_stale = False
             if request is not None:
+                if self.sawtooth_enabled:
+                    self.sawtooth_request_ledger.settle(
+                        scheduler_output.sawtooth_request_steps[req_id],
+                        request.num_in_flight_tokens - num_tokens_scheduled,
+                    )
                 request.num_in_flight_tokens -= num_tokens_scheduled
+                if self.sawtooth_enabled:
+                    if request.is_finished():
+                        # Abort retains request/KV ownership until the final
+                        # device result, so a continuation cannot use a new slot.
+                        if request.num_in_flight_tokens == 0:
+                            self._free_request(request)
+                        continue
+                    self.kv_cache_manager.cache_blocks(
+                        request,
+                        scheduler_output.sawtooth_token_ends[req_id],
+                    )
                 # Drain any stale share (see _preempt_request) in lockstep.
                 if request.num_stale_output_tokens > 0:
                     output_is_stale = True
@@ -2563,6 +2808,10 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        if self.sawtooth_enabled and request.num_in_flight_tokens:
+            # Keep worker slots and all KV blocks alive across virtual rounds.
+            return None, None
+
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -2589,6 +2838,9 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        if self.sawtooth_enabled:
+            self.sawtooth_request_ledger.forget(request.request_id)
+            self._sawtooth_prefill_lens.pop(request.request_id, None)
         self._free_request_blocks(request)
         del self.requests[request.request_id]
 
@@ -2695,6 +2947,10 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        if self.sawtooth_enabled and any(
+            request.num_in_flight_tokens for request in self.requests.values()
+        ):
+            return False
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()

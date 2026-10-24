@@ -1638,7 +1638,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if not dummy_run:
+        if not dummy_run and not getattr(self, "_sawtooth_skip_lifecycle", False):
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
@@ -1870,12 +1870,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
             n = input_batch.num_tokens_after_padding
-            new_tensors = {
-                k: v[:n]
-                if dummy_run
-                else v[:n].copy_(intermediate_tensors.tensors[k][:n])
-                for k, v in self.intermediate_tensors.tensors.items()
-            }
+            if getattr(self, "_sawtooth_active", False) and not dummy_run:
+                from vllm.v1.worker.gpu.sawtooth import copy_stage_inputs
+
+                new_tensors = copy_stage_inputs(
+                    self.intermediate_tensors, intermediate_tensors, n
+                )
+            else:
+                new_tensors = {
+                    k: v[:n]
+                    if dummy_run
+                    else v[:n].copy_(intermediate_tensors.tensors[k][:n])
+                    for k, v in self.intermediate_tensors.tensors.items()
+                }
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 

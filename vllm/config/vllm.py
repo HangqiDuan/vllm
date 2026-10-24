@@ -587,6 +587,17 @@ class VllmConfig:
 
     @property
     def max_concurrent_batches(self) -> int:
+        additional = self.additional_config
+        sawtooth = (
+            additional.get("sawtooth_pipeline", {})
+            if isinstance(additional, dict)
+            else {}
+        )
+        if sawtooth.get("enabled") and sawtooth.get("max_live_batches") is not None:
+            capacity = sawtooth["max_live_batches"]
+            if type(capacity) is not int or capacity < 1:
+                raise ValueError("sawtooth max_live_batches must be positive")
+            return capacity
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
         pp_size = self.parallel_config.pipeline_parallel_size

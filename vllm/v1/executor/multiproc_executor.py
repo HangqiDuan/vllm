@@ -12,7 +12,7 @@ import weakref
 from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, InvalidStateError
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -41,6 +41,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     model_parallel_is_initialized,
 )
+from vllm.distributed.sawtooth import is_sawtooth_enabled
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -70,9 +71,18 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.sawtooth import SawtoothRoundSubmitted
+from vllm.v1.sawtooth_trace import TracedOutput, command_context, get_sawtooth_trace
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
+
+
+def _use_async_output(vllm_config: VllmConfig) -> bool:
+    """Decouple response-ring backpressure without changing model scheduling."""
+    return vllm_config.scheduler_config.async_scheduling or is_sawtooth_enabled(
+        vllm_config
+    )
 
 
 class FutureWrapper(Future):
@@ -120,6 +130,8 @@ class MultiprocExecutor(Executor):
         # and ensure workers will be terminated.
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
+        self._sawtooth_enabled = is_sawtooth_enabled(self.vllm_config)
+        self._sawtooth_failure: Exception | None = None
         self.failure_callback: FailureCallback | None = None
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
@@ -385,6 +397,8 @@ class MultiprocExecutor(Executor):
     ) -> Any:
         """Returns single result if unique_reply_rank and/or an output
         aggregator is provided, otherwise list."""
+        if failure := getattr(self, "_sawtooth_failure", None):
+            raise failure
         assert self.rpc_broadcast_mq is not None, (
             "collective_rpc should not be called on follower node"
         )
@@ -395,8 +409,21 @@ class MultiprocExecutor(Executor):
         kwargs = kwargs or {}
 
         aggregators = [a for a in (kv_output_aggregator, ec_output_aggregator) if a]
+        sawtooth_all_rank = getattr(self, "_sawtooth_enabled", False) and method in (
+            "execute_model",
+            "sample_tokens",
+        )
         aggregate: Callable[[Any], Any]
-        if aggregators:
+        if sawtooth_all_rank:
+            if aggregators:
+                raise ValueError(
+                    "Sawtooth does not support KV/EC connector aggregation"
+                )
+            # All workers must report host submission/async-output errors.
+            # Waiting remains deferred to FutureWrapper.result(), never dispatch.
+            output_rank = None
+            aggregate = lambda x: x
+        elif aggregators:
             output_rank = None
 
             def _aggregate(outputs: Any) -> Any:
@@ -423,9 +450,9 @@ class MultiprocExecutor(Executor):
         if output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
 
-        def get_response():
+        def read_response():
             responses = []
-            for mq in response_mqs:
+            for rank, mq in enumerate(response_mqs):
                 dequeue_timeout = (
                     None if deadline is None else max(0.0, deadline - time.monotonic())
                 )
@@ -434,12 +461,61 @@ class MultiprocExecutor(Executor):
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
                 if status != WorkerProc.ResponseStatus.SUCCESS:
+                    if sawtooth_all_rank:
+                        raise RuntimeError(
+                            f"Sawtooth {method} rank {rank} failed: {result}"
+                        )
                     raise RuntimeError(
                         f"Worker failed with error '{result}', please check the"
                         " stack trace above for the root cause"
                     )
                 responses.append(result)
             return responses[0] if output_rank is not None else responses
+
+        def get_response():
+            # A prior RPC may have failed before consuming every response MQ.
+            # FutureWrapper continues draining older futures after exceptions;
+            # never reinterpret the unread tail as a later RPC's responses.
+            # This guard also covers already queued metadata/control RPCs.
+            if failure := getattr(self, "_sawtooth_failure", None):
+                raise failure
+            if not sawtooth_all_rank:
+                return read_response()
+            try:
+                responses = read_response()
+                command = (
+                    getattr(args[0], "sawtooth_execution", None)
+                    if method == "execute_model" and args
+                    else None
+                )
+                if command is not None:
+                    for rank, response in enumerate(responses):
+                        if command.is_last_round:
+                            valid = response is None
+                        else:
+                            valid = (
+                                isinstance(response, SawtoothRoundSubmitted)
+                                and response.execution == command
+                            )
+                        if not valid:
+                            raise RuntimeError(
+                                "Invalid sawtooth submission from "
+                                f"rank {rank} for command {command.command_seq}"
+                            )
+                # Other ranks may return EMPTY outputs or independently
+                # materialized AsyncModelRunnerOutputs. Only the real physical
+                # output rank (PP2/TP4: rank 4, not rank 7) supplies tokens.
+                reply_rank = (
+                    self.output_rank if unique_reply_rank is None else unique_reply_rank
+                )
+                return responses[reply_rank]
+            except Exception as error:
+                # Do not drain remaining MQs: a peer can be blocked in a
+                # collective after another rank failed. Poison this executor;
+                # the terminal future raises into EngineCore's fatal shutdown.
+                self._sawtooth_failure = error
+                self.is_failed = True
+                raise
 
         future = FutureWrapper(
             self.futures_queue, get_response=get_response, aggregate=aggregate
@@ -681,7 +757,12 @@ class WorkerProc:
 
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling
-        if self.use_async_scheduling:
+        # Sawtooth submits its complete cohort before reading responses. A
+        # synchronous response enqueue can fill the response ring, block this
+        # RPC thread, then fill the input ring before the engine can retire.
+        # Only output transport is decoupled; model scheduling stays unchanged.
+        self.use_async_output = _use_async_output(vllm_config)
+        if self.use_async_output:
             self.async_output_queue: queue.Queue = queue.Queue()
             self.async_output_copy_thread = Thread(
                 target=self.async_output_busy_loop,
@@ -984,9 +1065,26 @@ class WorkerProc:
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
+        trace = get_sawtooth_trace()
+        context = None
+        if isinstance(output, TracedOutput):
+            context, output = output.context, output.output
+        with (
+            trace.span("worker.enqueue_output", context)
+            if context is not None
+            else nullcontext()
+        ):
+            self._enqueue_output(output, trace, context)
+
+    def _enqueue_output(self, output, trace, context):
         if isinstance(output, AsyncModelRunnerOutput):
             try:
-                output = output.get_output()
+                with (
+                    trace.span("worker.get_output", context)
+                    if context is not None
+                    else nullcontext()
+                ):
+                    output = output.get_output()
             except Exception as e:
                 logger.exception("Error getting async model runner output")
                 output = e
@@ -996,17 +1094,36 @@ class WorkerProc:
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
-            response_mq.enqueue(result)
+            with (
+                trace.span("worker.response_enqueue", context)
+                if context is not None
+                else nullcontext()
+            ):
+                response_mq.enqueue(result)
 
-    def handle_output(self, output: Any):
-        """Handles output from the worker. If async scheduling is enabled,
-        it is passed to the async_output_busy_loop thread. Otherwise, it is
-        enqueued directly to the worker_response_mq.
+    def handle_output(self, output: Any, trace_context=None):
+        """Queue output when async scheduling or sawtooth requires it.
+
+        This only controls the host response pump, not model scheduling.
+        Otherwise output is enqueued directly to worker_response_mq.
         """
-        if self.use_async_scheduling:
-            self.async_output_queue.put(output)
+        trace = get_sawtooth_trace()
+        if trace_context is not None:
+            context = dict(
+                trace_context, output_id=id(output), output_type=type(output).__name__
+            )
+            output = TracedOutput(output, context)
         else:
-            self.enqueue_output(output)
+            context = None
+        with (
+            trace.span("worker.handle_output", context)
+            if context is not None
+            else nullcontext()
+        ):
+            if getattr(self, "use_async_output", self.use_async_scheduling):
+                self.async_output_queue.put(output)
+            else:
+                self.enqueue_output(output)
 
     def async_output_busy_loop(self):
         """Entrypoint for the thread which handles outputs asynchronously."""
@@ -1038,16 +1155,35 @@ class WorkerProc:
     ) -> None:
         """Execute one RPC in a separate frame from the dequeue loop."""
         method, args, kwargs, output_rank = rpc_request
+        trace = get_sawtooth_trace()
+        trace_context = None
+        if trace.enabled and method in ("execute_model", "sample_tokens"):
+            if method == "execute_model":
+                self._sawtooth_trace_command = command_context(
+                    args[0] if args else None
+                )
+            trace_context = dict(getattr(self, "_sawtooth_trace_command", {}))
+            trace_context.update(
+                rpc_method=method, rank=self.rank, rpc_id=trace.next_id()
+            )
         try:
             if isinstance(method, str):
                 func = getattr(self.worker, method)
             elif isinstance(method, bytes):
                 func = partial(cloudpickle.loads(method), self.worker)
 
-            output = func(*args, **kwargs)
+            with (
+                trace.span("worker.rpc", trace_context)
+                if trace_context is not None
+                else nullcontext()
+            ):
+                output = func(*args, **kwargs)
 
             if output_rank is None or self.rank == output_rank:
-                self.handle_output(output)
+                if trace_context is None:
+                    self.handle_output(output)
+                else:
+                    self.handle_output(output, trace_context)
         except Exception as e:
             # Notes have been introduced in python 3.11
             if hasattr(e, "add_note"):
@@ -1056,7 +1192,10 @@ class WorkerProc:
             # enqueue_output converts the exception to a FAILURE response
             # containing its string representation before transport.
             if output_rank is None or self.rank == output_rank:
-                self.handle_output(e)
+                if trace_context is None:
+                    self.handle_output(e)
+                else:
+                    self.handle_output(e, trace_context)
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:

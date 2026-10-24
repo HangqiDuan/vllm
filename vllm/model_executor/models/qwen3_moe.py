@@ -39,6 +39,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.distributed.sawtooth import get_sawtooth_plan
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -68,6 +69,11 @@ from .interfaces import (
     SupportsLoRA,
     SupportsPP,
     SupportsQuant,
+)
+from .sawtooth import (
+    SawtoothModelMixin,
+    decoder_carry_schema,
+    forward_sawtooth_decoder,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -424,6 +430,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 @support_torch_compile
 class Qwen3MoeModel(nn.Module, EagleModelMixin):
+    forward_sawtooth_stage = forward_sawtooth_decoder
+    get_sawtooth_carry_schema = decoder_carry_schema
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             # weight_name: (param_name, shard_id)
@@ -455,6 +463,8 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
 
         self.vocab_size = config.vocab_size
         self.config = config
+        self.sawtooth_plan = get_sawtooth_plan(vllm_config, config.num_hidden_layers)
+        self.sawtooth_dtype = vllm_config.model_config.dtype
         self.quant_config = quant_config
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -466,6 +476,7 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             config.num_hidden_layers,
             lambda prefix: decoder_layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
+            sawtooth_plan=self.sawtooth_plan,
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -482,6 +493,8 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if self.sawtooth_plan is not None:
+            raise RuntimeError("Sawtooth execution requires a fixed stage callable")
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -533,6 +546,7 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
 
 class Qwen3MoeForCausalLM(
     nn.Module,
+    SawtoothModelMixin,
     SupportsPP,
     SupportsLoRA,
     SupportsEagle,
@@ -580,6 +594,7 @@ class Qwen3MoeForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.init_sawtooth_stages(vllm_config)
 
         # Set MoE hyperparameters
 
@@ -616,6 +631,8 @@ class Qwen3MoeForCausalLM(
         self.num_local_physical_experts = num_local_physical_experts
         self.num_redundant_experts = num_physical_experts - self.num_logical_experts
         for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
             if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
                 moe = layer.mlp
                 moe.n_local_physical_experts = num_local_physical_experts

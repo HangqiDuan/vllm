@@ -36,6 +36,7 @@ from transformers import Qwen2Config
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed.sawtooth import get_sawtooth_plan
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import (
     Attention,
@@ -65,6 +66,11 @@ from .interfaces import (
     SupportsLoRA,
     SupportsPP,
     SupportsQuant,
+)
+from .sawtooth import (
+    SawtoothModelMixin,
+    decoder_carry_schema,
+    forward_sawtooth_decoder,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -321,6 +327,8 @@ class Qwen2DecoderLayer(nn.Module):
     }
 )
 class Qwen2Model(nn.Module, EagleModelMixin):
+    forward_sawtooth_stage = forward_sawtooth_decoder
+    get_sawtooth_carry_schema = decoder_carry_schema
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             # weight_name: (param_name, shard_id)
@@ -359,6 +367,8 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             )
 
         self.config = config
+        self.sawtooth_plan = get_sawtooth_plan(vllm_config, config.num_hidden_layers)
+        self.sawtooth_dtype = vllm_config.model_config.dtype
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
 
@@ -385,6 +395,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
+            sawtooth_plan=self.sawtooth_plan,
         )
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -405,6 +416,8 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if self.sawtooth_plan is not None:
+            raise RuntimeError("Sawtooth execution requires a fixed stage callable")
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -455,7 +468,13 @@ class Qwen2Model(nn.Module, EagleModelMixin):
 
 
 class Qwen2ForCausalLM(
-    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3, SupportsQuant
+    nn.Module,
+    SawtoothModelMixin,
+    SupportsLoRA,
+    SupportsPP,
+    SupportsEagle,
+    SupportsEagle3,
+    SupportsQuant,
 ):
     hf_to_vllm_mapper = Qwen2Model.hf_to_vllm_mapper
     packed_modules_mapping = {
@@ -492,6 +511,7 @@ class Qwen2ForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.init_sawtooth_stages(vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

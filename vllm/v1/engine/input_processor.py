@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.distributed.sawtooth import is_sawtooth_enabled
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import (
     EngineInput,
@@ -88,6 +89,13 @@ class InputProcessor:
     ) -> None:
         """Raise `ValueError` if SamplingParams or PoolingParams is not valid."""
         if isinstance(params, SamplingParams):
+            if params.structured_outputs is not None and is_sawtooth_enabled(
+                self.vllm_config
+            ):
+                raise VLLMValidationError(
+                    "Structured output requests are not yet supported with "
+                    "sawtooth pipeline"
+                )
             supported_generation_tasks = [
                 task for task in supported_tasks if task in GENERATION_TASKS
             ]

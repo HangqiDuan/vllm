@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.sawtooth import SawtoothExecution, SawtoothRequestStep
 
 if TYPE_CHECKING:
     import numpy as np
@@ -303,6 +304,14 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # A virtual round is not a new token scheduling step.
+    sawtooth_execution: SawtoothExecution | None = None
+    sawtooth_token_ends: dict[str, int] | None = None
+    sawtooth_request_steps: dict[str, SawtoothRequestStep] | None = None
+    # Admission-time snapshot: at least one true V2 decode row, even if mixed
+    # with prefill. Virtual rounds must not recompute it from live request state.
+    sawtooth_has_decode: bool = False
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

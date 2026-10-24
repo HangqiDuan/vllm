@@ -237,6 +237,15 @@ class EngineCore:
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
+        from vllm.distributed.sawtooth import is_sawtooth_enabled
+
+        self.sawtooth_engine = None
+        if is_sawtooth_enabled(vllm_config):
+            from vllm.v1.engine.sawtooth import SawtoothEngine
+
+            self.sawtooth_engine = SawtoothEngine(self)
+            self.step_fn = self.sawtooth_engine.step
+
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
@@ -1393,6 +1402,7 @@ class EngineCoreProc(EngineCore):
             self.engines_running
             or self.scheduler.has_requests()
             or bool(self.batch_queue)
+            or bool(self.sawtooth_engine)
         )
 
     def is_running(self) -> bool:

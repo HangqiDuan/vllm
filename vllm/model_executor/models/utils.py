@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from transformers.conversion_mapping import WeightRenaming
 
     from vllm.config.model import ModelConfig
+    from vllm.distributed.sawtooth import StagePlan
     from vllm.model_executor.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)
@@ -856,6 +857,8 @@ def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
     prefix: str,
+    *,
+    sawtooth_plan: "StagePlan | None" = None,
 ) -> tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function, taking
     pipeline parallelism into account.
@@ -871,6 +874,22 @@ def make_layers(
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.distributed.utils import get_pp_indices
     from vllm.model_executor.offloader import get_offloader
+
+    if sawtooth_plan is not None:
+        local_ids = sawtooth_plan.local_layer_ids(get_pp_group().rank_in_group)
+        local = set(local_ids)
+        # Preserve checkpoint layer indices even when ownership is disjoint.
+        owned_modules = iter(
+            get_offloader().wrap_modules(
+                layer_fn(prefix=f"{prefix}.{idx}") for idx in local_ids
+            )
+        )
+        modules = torch.nn.ModuleList(
+            next(owned_modules) if idx in local else PPMissingLayer()
+            for idx in range(num_hidden_layers)
+        )
+        # These bounds describe storage only; execution uses immutable stages.
+        return local_ids[0], local_ids[-1] + 1, modules
 
     start_layer, end_layer = get_pp_indices(
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
