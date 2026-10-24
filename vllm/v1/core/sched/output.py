@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.sawtooth import SawtoothExecution, SawtoothRequestStep
 
 if TYPE_CHECKING:
     import numpy as np
@@ -311,6 +312,13 @@ class SchedulerOutput:
     # Deprecated: cascade attention has been removed, so this is always empty.
     # Kept for out-of-tree schedulers and workers.
     num_common_prefix_blocks: list[int] = field(default_factory=list)
+    # A virtual round is not a new token scheduling step.
+    sawtooth_execution: SawtoothExecution | None = None
+    sawtooth_token_ends: dict[str, int] | None = None
+    sawtooth_request_steps: dict[str, SawtoothRequestStep] | None = None
+    # Admission-time snapshot: at least one true V2 decode row, even if mixed
+    # with prefill. Virtual rounds must not recompute it from live request state.
+    sawtooth_has_decode: bool = False
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
