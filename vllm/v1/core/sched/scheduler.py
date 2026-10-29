@@ -689,6 +689,8 @@ class Scheduler(SchedulerInterface):
             # A tail inside a populated batch is not an isolated batch.
             or bool(scheduled)
             or count < 2
+            # Keep a full token-budget batch intact even without a partner.
+            or count >= self.max_num_scheduled_tokens
             or not self.scheduler_config.enable_chunked_prefill
             or self.need_mamba_block_aligned_split
             or self.num_prefill_lookahead
@@ -747,6 +749,23 @@ class Scheduler(SchedulerInterface):
         # Commit the marker only if allocation actually admits this request.
         self._sawtooth_tail_candidates[request.request_id] = True
         return (count + 1) // 2
+
+    def _sawtooth_can_pack_prefill_tail(self, scheduled: dict[str, int]) -> bool:
+        """Let a chunked prompt's tail share its unused budget with prefill."""
+        if (
+            not self.sawtooth_enabled
+            or not self.scheduler_config.enable_chunked_prefill
+        ):
+            return False
+        has_tail = False
+        for request_id, count in scheduled.items():
+            request = self.requests[request_id]
+            start = request.num_computed_tokens
+            end = self._sawtooth_prefill_lens.get(request_id, request.num_prompt_tokens)
+            if start >= end:
+                return False
+            has_tail |= start > 0 and start + count == end
+        return has_tail
 
     def _sawtooth_request_cap(self, defer_prefills: bool) -> int:
         """Leave independent requests for the other free pipeline slots.
@@ -888,7 +907,10 @@ class Scheduler(SchedulerInterface):
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
-            if len(num_scheduled_tokens) >= request_cap:
+            at_request_cap = len(num_scheduled_tokens) >= request_cap
+            if at_request_cap and not self._sawtooth_can_pack_prefill_tail(
+                num_scheduled_tokens
+            ):
                 break
             request = self.running[req_index]
             if self.sawtooth_enabled:
@@ -898,6 +920,7 @@ class Scheduler(SchedulerInterface):
                 is_decode = self._sawtooth_is_decode(request, candidate_tokens)
                 if (
                     not candidate_tokens
+                    or (at_request_cap and is_decode)
                     or (self.sawtooth_decode_only and not is_decode)
                     or (self.sawtooth_prefill_only and is_decode)
                 ):
@@ -1170,7 +1193,10 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if len(num_scheduled_tokens) >= request_cap:
+                at_request_cap = len(num_scheduled_tokens) >= request_cap
+                if at_request_cap and not self._sawtooth_can_pack_prefill_tail(
+                    num_scheduled_tokens
+                ):
                     break
                 if input_budget <= draft_slots:
                     break
@@ -1185,6 +1211,10 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if at_request_cap and self._sawtooth_is_decode(request, 1):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(

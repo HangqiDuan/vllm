@@ -124,8 +124,8 @@ def _drain_tail_engine(engine, sched):
 @pytest.mark.parametrize(
     "length,counts",
     [
-        (7168, [1024] * 6 + [512, 512]),
-        (3072, [1024, 1024, 512, 512]),
+        (7168, [1024] * 7),
+        (3072, [1024] * 3),
         (4096, [1024] * 4),
         (2548, [1024, 1024, 250, 250]),
         (2549, [1024, 1024, 251, 250]),
@@ -357,7 +357,7 @@ def test_failed_split_submission_does_not_publish_tokens_or_release_kv(
 
 
 @pytest.mark.parametrize(
-    "length,counts", [(3072, [1024, 1024]), (4096, [1024, 1024, 512, 512])]
+    "length,counts", [(3072, [1024, 1024]), (4096, [1024] * 3)]
 )
 def test_tail_pairing_uses_live_cohort_instead_of_original_prompt_parity(
     admission_scheduler, length, counts
@@ -771,3 +771,86 @@ def test_short_tail_fills_remaining_budget_before_final_tail_split(
     assert {request.request_id: 4179, "partner": 6061} in heads
     assert heads[-2:] == [{"partner": 4179}, {"partner": 4179}]
     assert sum(sum(h.values()) for h in heads) == 2 * 65619
+
+
+@pytest.mark.parametrize("capacity", [2, 3])
+@pytest.mark.parametrize("arrival_step", [0, 1, 2, 3, 4, 5])
+def test_two_50k_prefills_pack_five_full_batches(
+    admission_scheduler, tmp_path, capacity, arrival_step
+):
+    # A prompt boundary must not leave half of a prefill batch unused.
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["max_position_embeddings"] = 131072
+    config_path.write_text(json.dumps(config))
+
+    def configured(**kwargs):
+        kwargs["max_num_batched_tokens"] = 20480
+        return admission_scheduler(**kwargs)
+
+    engine, sched, executor, request = _tail_engine(
+        configured,
+        51200,
+        capacity=capacity,
+        max_model_len=131072,
+        num_blocks=20000,
+    )
+    for _ in range(arrival_step):
+        engine.step()
+    (partner,) = create_requests(
+        1, num_tokens=51200, max_tokens=1, req_ids=["partner"]
+    )
+    sched.add_request(partner)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    batches = [o.num_scheduled_tokens for o in heads]
+    assert [sum(b.values()) for b in batches] == [20480] * 5, batches
+    assert {request.request_id: 10240, partner.request_id: 10240} in batches
+    for req in (request, partner):
+        end = 0
+        for out in heads:
+            if req.request_id not in out.num_scheduled_tokens:
+                continue
+            step = out.sawtooth_request_steps[req.request_id]
+            assert step.token_start == end
+            end = step.token_end
+        assert end == 51200
+        assert req.num_in_flight_tokens == 0
+        assert req.num_output_tokens == 1
+        assert req.request_id not in sched.requests
+
+
+@pytest.mark.parametrize("limits", [{"max_num_seqs": 1}, {"num_blocks": 3500}])
+def test_prefill_tail_packing_preserves_resource_admission(
+    admission_scheduler, tmp_path, limits
+):
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["max_position_embeddings"] = 131072
+    config_path.write_text(json.dumps(config))
+
+    def configured(**kwargs):
+        kwargs["max_num_batched_tokens"] = 20480
+        kwargs.update(limits)
+        return admission_scheduler(**kwargs)
+
+    engine, sched, executor, request = _tail_engine(
+        configured, 51200, capacity=3, max_model_len=131072
+    )
+    for _ in range(5):
+        engine.step()
+    (partner,) = create_requests(
+        1, num_tokens=51200, max_tokens=1, req_ids=["partner"]
+    )
+    sched.add_request(partner)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert all(o.total_num_scheduled_tokens <= 20480 for o in heads)
+    assert all(len(o.num_scheduled_tokens) == 1 for o in heads)
+    for req in (request, partner):
+        assert sum(
+            o.num_scheduled_tokens.get(req.request_id, 0) for o in heads
+        ) == 51200
+        assert req.num_output_tokens == 1
+        assert req.num_in_flight_tokens == 0
+        assert req.request_id not in sched.requests
