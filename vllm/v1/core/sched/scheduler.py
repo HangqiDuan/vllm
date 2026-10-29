@@ -689,8 +689,6 @@ class Scheduler(SchedulerInterface):
             # A tail inside a populated batch is not an isolated batch.
             or bool(scheduled)
             or count < 2
-            # Keep a full token-budget batch intact even without a partner.
-            or count >= self.max_num_scheduled_tokens
             or not self.scheduler_config.enable_chunked_prefill
             or self.need_mamba_block_aligned_split
             or self.num_prefill_lookahead
