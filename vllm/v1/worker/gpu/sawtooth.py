@@ -44,6 +44,9 @@ class KeyedPPHandler:
         self.current_steps: dict[str, SawtoothRequestStep] = {}
         self.sample_steps: dict[str, SawtoothRequestStep] | None = None
         self.retired_events: dict[int, object] = {}
+        self.allow_prefill_overlap = False
+        self.admitted_steps: dict[tuple[str, int, int], int] = {}
+        self.group_steps: dict[tuple[str, int], SawtoothRequestStep] = {}
 
     def __getattr__(self, name):
         return getattr(self.native, name)
@@ -82,18 +85,31 @@ class KeyedPPHandler:
                     if producer is not None or rid in self.current_steps:
                         raise RuntimeError("Request generation reused without cleanup")
                 else:
-                    if producer is None or producer.step.key != step.predecessor:
+                    previous = self.current_steps.get(rid)
+                    overlaps_prefill = (
+                        self.allow_prefill_overlap
+                        and previous is not None
+                        and previous.key == step.predecessor
+                        and not previous.produces_sample
+                        and previous.token_end == step.token_start
+                        and self.group_steps.get((rid, 0)) == previous
+                    )
+                    if overlaps_prefill:
+                        # Same-stream group order protects KV. No token is needed.
+                        pass
+                    elif producer is None or producer.step.key != step.predecessor:
                         raise RuntimeError(
                             "Missing exact sawtooth sample/state predecessor"
                         )
-                    if not producer.applied:
+                    elif not producer.applied:
                         self._consume(producer.batch_id, runner)
                     # This includes no-sample prompt chunks: their local count
                     # update is sufficient, without a last-rank broadcast.
-                    if id(producer.event) not in waited_events:
+                    if not overlaps_prefill and id(producer.event) not in waited_events:
                         self.native.main_stream.wait_event(producer.event)
                         waited_events.add(id(producer.event))
                 self.current_steps[rid] = step
+                self.admitted_steps[step.key] = batch_id
             # Remaining IDs are lifecycle cleanup, not wildcard dependencies.
             wanted.difference_update(steps)
         for key, (req_ids, _) in tuple(self.pending.items()):
@@ -108,6 +124,29 @@ class KeyedPPHandler:
             if not event.query()
         }
 
+    def begin_round(self, round_id, steps):
+        """Validate each group's own predecessor before any KV writes."""
+        for rid, step in steps.items():
+            if step.key not in self.admitted_steps:
+                raise RuntimeError("Sawtooth group has no admitted input version")
+            previous = self.group_steps.get((rid, round_id))
+            if (
+                (step.predecessor is None and previous is not None)
+                or (
+                    step.predecessor is not None
+                    and (
+                        previous is None
+                        or previous.key != step.predecessor
+                        or previous.token_end != step.token_start
+                    )
+                )
+            ):
+                raise RuntimeError("Missing exact sawtooth group predecessor")
+
+    def complete_round(self, round_id, steps):
+        for rid, step in steps.items():
+            self.group_steps[rid, round_id] = step
+
     def complete_sample(self):
         """Called after sample RPC enqueues all persistent state updates."""
         steps = self.sample_steps
@@ -115,7 +154,11 @@ class KeyedPPHandler:
             raise RuntimeError("Sawtooth sample has no final execution identity")
         event = self.native.main_stream.record_event()
         for rid, step in steps.items():
-            if self.current_steps.get(rid) != step:
+            if self.current_steps.get(rid) != step and not (
+                self.allow_prefill_overlap
+                and not step.produces_sample
+                and self.admitted_steps.get(step.key) == self.batch_id
+            ):
                 raise RuntimeError("Sampling a superseded sawtooth input version")
             previous = self.producers.get(rid)
             if previous is not None:
@@ -131,6 +174,7 @@ class KeyedPPHandler:
             ):
                 raise RuntimeError("Sampled step has no pending token receive")
             self.producers[rid] = _ProducerReady(step, self.batch_id, event, applied)
+            self.admitted_steps.pop(step.key, None)
         self.sample_steps = None
 
     def forget_requests(self, request_ids):
@@ -143,6 +187,9 @@ class KeyedPPHandler:
                     )
                 self.retired_events[id(producer.event)] = producer.event
             self.current_steps.pop(rid, None)
+            self.group_steps = {
+                key: step for key, step in self.group_steps.items() if key[0] != rid
+            }
 
     def get_prev_sampled_outputs(self, *args, **kwargs):
         # Virtual execution commands never advance the native PP-size FIFO.

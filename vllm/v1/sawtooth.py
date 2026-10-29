@@ -67,6 +67,8 @@ class _RequestSteps:
     completed_end: int
     next_step: int = 0
     tail_enqueued: int = -1
+    head_enqueued: int = -1
+    tail_split: bool = False
     live: deque[SawtoothRequestStep] = field(default_factory=deque)
 
 
@@ -76,16 +78,38 @@ class SawtoothRequestLedger:
     def __init__(self):
         self.requests: dict[str, _RequestSteps] = {}
         self.next_generation = 0
+        self.allow_prefill_overlap = False
 
     def can_advance(self, request_id: str) -> bool:
         state = self.requests.get(request_id)
         return bool(
             state is not None
             and len(state.live) == 1
-            and state.tail_enqueued == state.live[-1].step_id
+            and (
+                state.tail_enqueued == state.live[-1].step_id
+                or (
+                    self.allow_prefill_overlap
+                    and not state.live[-1].produces_sample
+                    and state.head_enqueued == state.live[-1].step_id
+                )
+            )
         )
 
-    def admit(self, request_id, start, count, produces_sample):
+    def can_overlap_prefill(self, request_id: str) -> bool:
+        state = self.requests.get(request_id)
+        return bool(
+            self.allow_prefill_overlap
+            and state is not None
+            and len(state.live) == 1
+            and not state.live[-1].produces_sample
+            and state.head_enqueued == state.live[-1].step_id
+        )
+
+    def has_split_tail(self, request_id: str) -> bool:
+        state = self.requests.get(request_id)
+        return state is not None and state.tail_split
+
+    def admit(self, request_id, start, count, produces_sample, *, split_tail=False):
         state = self.requests.get(request_id)
         if state is None:
             state = _RequestSteps(self.next_generation, start, start)
@@ -105,8 +129,15 @@ class SawtoothRequestLedger:
         )
         state.next_step += 1
         state.scheduled_end = step.token_end
+        state.tail_split |= split_tail
         state.live.append(step)
         return step
+
+    def mark_head_enqueued(self, step: SawtoothRequestStep) -> None:
+        state = self.requests[step.request_id]
+        if step not in state.live or step.step_id != state.head_enqueued + 1:
+            raise RuntimeError("Out-of-order sawtooth head submission")
+        state.head_enqueued = step.step_id
 
     def mark_tail_enqueued(self, step: SawtoothRequestStep) -> None:
         state = self.requests[step.request_id]

@@ -59,6 +59,9 @@ class Scheduler:
     def sawtooth_can_schedule(self, request):
         return not request.num_in_flight_tokens
 
+    def sawtooth_has_prefill_candidate(self, *, require_eligible=False):
+        return bool(self.waiting)
+
     def sawtooth_mark_tail_enqueued(self, output):
         pass
 
@@ -481,6 +484,63 @@ class ChainedScheduler(Scheduler):
         return {0: output.request_id}
 
 
+def test_same_request_prefill_heads_precede_both_tails_without_terminal_wait():
+    class PrefillScheduler(ChainedScheduler):
+        def __init__(self):
+            super().__init__()
+            self.sawtooth_request_ledger = self.ledger
+
+        def sawtooth_can_schedule(self, request):
+            return self.admitted < 2 and (
+                not request.num_in_flight_tokens
+                or self.ledger.can_overlap_prefill(request.request_id)
+            )
+
+        def sawtooth_mark_head_enqueued(self, output):
+            for step in output.sawtooth_request_steps.values():
+                self.ledger.mark_head_enqueued(step)
+
+        def schedule(self, throttle):
+            if not self.running:
+                rid = self.waiting.popleft()
+                request = SimpleNamespace(
+                    request_id=rid, num_in_flight_tokens=0,
+                    is_finished=lambda: False,
+                )
+                self.running.append(request)
+                self.requests[rid] = request
+            request = self.running[0]
+            step = self.ledger.admit(
+                request.request_id, self.admitted, 1, self.admitted == 1
+            )
+            request.num_in_flight_tokens += 1
+            self.admitted += 1
+            return Output(
+                request.request_id,
+                sawtooth_request_steps={request.request_id: step},
+            )
+
+    initial, _, executor = make_engine(1, 2, 2)
+    core = initial.core
+    core.vllm_config.additional_config["sawtooth_pipeline"][
+        "enable_prefill_chunk_overlap"
+    ] = True
+    core.scheduler = scheduler = PrefillScheduler()
+    engine = SawtoothEngine(core)
+    reads = []
+    executor.before_response = lambda: reads.append(True)
+    for _ in range(4):
+        engine.step()
+    assert [
+        (out.sawtooth_execution.batch_id, out.sawtooth_execution.round_id)
+        for out in executor.commands
+    ] == [(0, 0), (1, 0), (0, 1), (1, 1)]
+    assert not reads
+    engine.step()
+    engine.step()
+    assert len(scheduler.updates) == 2 and not engine
+
+
 @pytest.mark.parametrize("rounds", [2, 3, 4])
 @pytest.mark.parametrize("enable_early_admission", [None, True])
 def test_same_request_head_uses_free_slot_before_predecessor_terminal(
@@ -630,7 +690,7 @@ class AdmissionScheduler(Scheduler):
     def sawtooth_has_decode_candidate(self):
         return bool(self.ready_decodes)
 
-    def sawtooth_has_prefill_candidate(self):
+    def sawtooth_has_prefill_candidate(self, *, require_eligible=False):
         return bool(self.waiting)
 
     def schedule(self, throttle):
@@ -977,3 +1037,19 @@ def test_single_slot_decode_guard_releases_prefill_after_slot_retirement(rounds)
         engine.step()
     assert scheduler.updates == ["decode-0", "waiting-prefill"]
     assert not engine and not executor.responses
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_dependent_decode_policy_tracks_prefill_candidates(overlap):
+    initial, scheduler, executor = make_engine(0, 2, 2)
+    initial.core.vllm_config.additional_config["sawtooth_pipeline"][
+        "enable_prefill_chunk_overlap"
+    ] = overlap
+    scheduler.sawtooth_request_ledger = SawtoothRequestLedger()
+    engine = SawtoothEngine(initial.core)
+    # A policy hint alone must not fabricate a batch or block engine progress.
+    for available in (True, False, True):
+        scheduler.sawtooth_has_prefill_candidate = lambda **kwargs: available
+        assert engine.step() == ({}, False)
+        assert scheduler.sawtooth_defer_dependent_decode == (overlap and available)
+    assert not executor.commands
