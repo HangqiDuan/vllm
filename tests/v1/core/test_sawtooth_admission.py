@@ -124,8 +124,8 @@ def _drain_tail_engine(engine, sched):
 @pytest.mark.parametrize(
     "length,counts",
     [
-        (7168, [1024] * 7),
-        (3072, [1024] * 3),
+        (7168, [1024] * 6 + [512, 512]),
+        (3072, [1024] * 2 + [512, 512]),
         (4096, [1024] * 4),
         (2548, [1024, 1024, 250, 250]),
         (2549, [1024, 1024, 251, 250]),
@@ -357,7 +357,7 @@ def test_failed_split_submission_does_not_publish_tokens_or_release_kv(
 
 
 @pytest.mark.parametrize(
-    "length,counts", [(3072, [1024, 1024]), (4096, [1024] * 3)]
+    "length,counts", [(3072, [1024, 1024]), (4096, [1024, 1024, 512, 512])]
 )
 def test_tail_pairing_uses_live_cohort_instead_of_original_prompt_parity(
     admission_scheduler, length, counts
@@ -775,7 +775,7 @@ def test_short_tail_fills_remaining_budget_before_final_tail_split(
 
 @pytest.mark.parametrize("capacity", [2, 3])
 @pytest.mark.parametrize("arrival_step", [0, 1, 2, 3, 4, 5])
-def test_two_50k_prefills_pack_five_full_batches(
+def test_two_50k_prefills_pack_boundary_before_splitting_unpaired_tail(
     admission_scheduler, tmp_path, capacity, arrival_step
 ):
     # A prompt boundary must not leave half of a prefill batch unused.
@@ -804,7 +804,10 @@ def test_two_50k_prefills_pack_five_full_batches(
     _drain_tail_engine(engine, sched)
     heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
     batches = [o.num_scheduled_tokens for o in heads]
-    assert [sum(b.values()) for b in batches] == [20480] * 5, batches
+    # Early admission can give the final full chunk a live cohort partner.
+    paired_tail = capacity == 3 and arrival_step < 3
+    expected = [20480] * 5 if paired_tail else [20480] * 4 + [10240, 10240]
+    assert [sum(b.values()) for b in batches] == expected, batches
     assert {request.request_id: 10240, partner.request_id: 10240} in batches
     for req in (request, partner):
         end = 0
@@ -953,3 +956,39 @@ def test_next_prefill_head_overlaps_a_full_finishing_batch(
         assert req.num_in_flight_tokens == 0
         assert req.request_id not in sched.requests
     assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == num_blocks - 1
+
+
+@pytest.mark.parametrize("length", [51200, 61440, 71680])
+def test_only_unpaired_final_full_batch_splits(admission_scheduler, tmp_path, length):
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["max_position_embeddings"] = 131072
+    config_path.write_text(json.dumps(config))
+
+    def configured(**kwargs):
+        kwargs["max_num_batched_tokens"] = 20480
+        return admission_scheduler(**kwargs)
+
+    engine, sched, executor, request = _tail_engine(
+        configured, length, capacity=3, max_model_len=131072, num_blocks=6000
+    )
+    sched.scheduler_reserve_full_isl = True
+    (partner,) = create_requests(1, num_tokens=length, max_tokens=1, req_ids=["B"])
+    sched.add_request(partner)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    totals = [o.total_num_scheduled_tokens for o in heads]
+    # 60k x 2 already pairs all six full batches. 50k/70k end with a lone batch.
+    expected = (
+        [20480] * (length // 10240 - 1) + [10240, 10240]
+        if length != 61440
+        else [20480] * 6
+    )
+    assert totals == expected
+    assert sum(totals) == length * 2
+    for req in (request, partner):
+        assert req.num_output_tokens == 1
+        assert req.num_preemptions == 0
+        assert req.num_in_flight_tokens == 0
+        assert req.request_id not in sched.requests
+    assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == 5999
