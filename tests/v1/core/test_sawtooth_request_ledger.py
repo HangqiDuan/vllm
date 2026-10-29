@@ -6,6 +6,35 @@ import pytest
 from vllm.v1.sawtooth import SawtoothRequestLedger
 
 
+def test_unsampled_prefill_can_overlap_before_tail_but_not_release_its_lease():
+    ledger = SawtoothRequestLedger()
+    ledger.allow_prefill_overlap = True
+    first = ledger.admit("r", 0, 10240, False)
+    assert not ledger.can_advance("r")
+    ledger.mark_head_enqueued(first)
+    assert ledger.can_advance("r")
+    second = ledger.admit("r", 10240, 6144, True)
+    ledger.mark_head_enqueued(second)
+    assert not ledger.can_advance("r")
+    with pytest.raises(RuntimeError, match="live"):
+        ledger.forget("r")
+    ledger.mark_tail_enqueued(first)
+    ledger.settle(first, 6144)
+    assert not ledger.can_advance("r")
+    ledger.mark_tail_enqueued(second)
+    assert ledger.can_advance("r")
+    ledger.settle(second, 0)
+
+
+def test_head_submission_does_not_bypass_sample_dependency_or_disabled_overlap():
+    for enabled, sampled in [(False, False), (True, True)]:
+        ledger = SawtoothRequestLedger()
+        ledger.allow_prefill_overlap = enabled
+        first = ledger.admit("r", 0, 10240, sampled)
+        ledger.mark_head_enqueued(first)
+        assert not ledger.can_advance("r")
+
+
 def test_tail_submission_only_opens_one_successor_not_resource_reclamation():
     ledger = SawtoothRequestLedger()
     first = ledger.admit("r", 8, 16, False)

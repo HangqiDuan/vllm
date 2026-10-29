@@ -122,6 +122,46 @@ def request_step(rid, step_id, sampled=True, generation=0):
     return SawtoothRequestStep(rid, generation, step_id, step_id, step_id + 1, sampled)
 
 
+def test_prefill_successor_interleaves_groups_without_waiting_for_sample():
+    handler, runner, waits, updates = ready_fixture()
+    handler.allow_prefill_overlap = True
+    first = {"A": SawtoothRequestStep("A", 0, 0, 0, 10240, False)}
+    second = {"A": SawtoothRequestStep("A", 0, 1, 10240, 16384, True)}
+    handler.begin_batch(0, first, runner, first)
+    handler.begin_round(0, first)
+    handler.complete_round(0, first)
+    handler.begin_batch(1, second, runner, second)
+    handler.begin_round(0, second)
+    handler.complete_round(0, second)
+    # The predecessor still owns its later group and terminal completion.
+    handler.begin_round(1, first)
+    handler.complete_round(1, first)
+    handler.batch_id = 0
+    handler.sample_steps = first
+    handler.complete_sample()
+    handler.begin_round(1, second)
+    handler.complete_round(1, second)
+    handler.batch_id = 1
+    handler.sample_steps = second
+    handler.receive(SimpleNamespace(req_ids=["A"]))
+    handler.complete_sample()
+    assert not waits and not updates
+    assert handler.producers["A"].step == second["A"]
+
+
+def test_prefill_overlap_cannot_skip_same_group_predecessor():
+    handler, runner, _, _ = ready_fixture()
+    handler.allow_prefill_overlap = True
+    first = {"A": request_step("A", 0, sampled=False)}
+    second = {"A": request_step("A", 1)}
+    handler.begin_batch(0, first, runner, first)
+    handler.begin_round(0, first)
+    handler.complete_round(0, first)
+    handler.begin_batch(1, second, runner, second)
+    with pytest.raises(RuntimeError, match="group predecessor"):
+        handler.begin_round(1, second)
+
+
 def publish(handler, runner, batch_id, steps):
     handler.begin_batch(batch_id, steps, runner, steps)
     handler.sample_steps = steps

@@ -37,6 +37,7 @@ class SawtoothEngine:
         if core.is_pooling_model:
             raise ValueError("Sawtooth requires a generation model")
         self.capacity = config.max_concurrent_batches
+        core.scheduler.sawtooth_pipeline_capacity = self.capacity
         self.slots = deque(range(self.capacity))
         self.generations = [0] * self.capacity
         self.active: deque[LogicalBatch] = deque()
@@ -77,6 +78,8 @@ class SawtoothEngine:
                 output, non_block=True
             )
         batch.command_futures.append((command, batch.exec_future))
+        if command.is_first_round and self.plan.config.enable_prefill_chunk_overlap:
+            self.core.scheduler.sawtooth_mark_head_enqueued(batch.scheduler_output)
         if command.is_last_round:
             grammar = self.core.scheduler.get_grammar_bitmask(batch.scheduler_output)
             with self.trace.span("engine.sample_enqueue", context):
@@ -153,9 +156,24 @@ class SawtoothEngine:
 
     def _schedule(self):
         self.core.scheduler.sawtooth_available_batches = len(self.slots)
+        # A frozen older cohort may still own slots, but cannot partner a new
+        # head. Its FIFO retirement releases room before the new continuation.
+        self.core.scheduler.sawtooth_split_prefill_tail = bool(
+            self.plan.config.enable_prefill_chunk_overlap
+            and self.plan.pipeline_size == 2
+            and self.plan.virtual_size == 2
+            and self.capacity >= 2
+            and (len(self.slots) >= 2 or self.phase_limit is not None)
+            and not any(
+                self.phase_limit is None or batch.batch_id > self.phase_limit
+                for batch in self.rounds
+            )
+        )
         return self.core.scheduler.schedule(self.core._should_throttle_prefills())
 
     def step(self):
+        if self.plan.config.enable_prefill_chunk_overlap:
+            self.core.scheduler.sawtooth_request_ledger.allow_prefill_overlap = True
         # An early dependent head must not insert a sample wait ahead of older
         # ready continuations.
         self.core.scheduler.sawtooth_allow_early_admission = (
@@ -172,6 +190,7 @@ class SawtoothEngine:
             return self._retire_control()
 
         scheduler = self.core.scheduler
+        scheduler.sawtooth_defer_dependent_decode = False
         decode_debt = any(
             batch.scheduler_output.sawtooth_has_decode for batch in self.rounds
         )
@@ -194,6 +213,14 @@ class SawtoothEngine:
                     scheduler.sawtooth_prefill_only = True
                 else:
                     self.prefill_turn = False
+
+        # Probe with the old filter cleared: a previous P opportunity must
+        # not suppress independent decode admission after prefills finish.
+        scheduler.sawtooth_defer_dependent_decode = (
+            self.plan.config.enable_prefill_chunk_overlap
+            and not scheduler.sawtooth_decode_only
+            and scheduler.sawtooth_has_prefill_candidate(require_eligible=True)
+        )
 
         if not self.decode_draining and self._can_admit():
             output = self._schedule()
