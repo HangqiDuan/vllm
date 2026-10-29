@@ -769,20 +769,36 @@ class Scheduler(SchedulerInterface):
 
     def _sawtooth_finishing_prefill(self, scheduled: dict[str, int]) -> bool:
         if (
-            len(self.running) != 1
-            or len(scheduled) != 1
+            not self.sawtooth_enabled
+            or not self.scheduler_config.enable_chunked_prefill
+            or len(self.running) != 1
             or self.num_waiting_for_streaming_input
             or self.connector is not None
-            or not self._sawtooth_can_pack_prefill_tail(scheduled)
         ):
             return False
         request = self.running[0]
-        return (
-            request.request_id in scheduled
-            and request.max_tokens == 1
-            and not request.num_output_tokens
-            and not request.resumable
-            and not request.use_structured_output
+        if (
+            request.max_tokens != 1
+            or request.num_output_tokens
+            or request.is_finished()
+            or request.resumable
+            or request.use_structured_output
+        ):
+            return False
+        if scheduled:
+            return (
+                len(scheduled) == 1
+                and request.request_id in scheduled
+                and self._sawtooth_can_pack_prefill_tail(scheduled)
+            )
+        # A full tail leaves no room in its own batch. Its submitted head can
+        # instead partner the next request's head in another logical batch.
+        # This relaxes admission only; the allocator still owns A's live KV.
+        end = self._sawtooth_prefill_lens.get(
+            request.request_id, request.num_prompt_tokens
+        )
+        return self.sawtooth_request_ledger.has_enqueued_final_prefill(
+            request.request_id, end
         )
 
     def _sawtooth_request_cap(self, defer_prefills: bool) -> int:
@@ -1532,8 +1548,9 @@ class Scheduler(SchedulerInterface):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async or self.sawtooth_enabled,
                     num_encoder_tokens=num_encoder_tokens,
-                    # This sole request finishes in the shared batch. Its KV
-                    # is released before the new request needs its full prompt.
+                    # A sole one-token request finishes in this batch or an
+                    # older in-flight batch. Keep its KV until normal retirement;
+                    # the next request must still fit its current chunk.
                     full_sequence_must_fit=(
                         self.scheduler_reserve_full_isl
                         and not self._sawtooth_finishing_prefill(num_scheduled_tokens)
