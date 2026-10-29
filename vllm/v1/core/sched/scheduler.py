@@ -95,7 +95,12 @@ class Scheduler(SchedulerInterface):
         # The engine supplies the number of free logical-batch slots before
         # admission. Direct scheduler callers retain ordinary batch sizing.
         self.sawtooth_available_batches = 1
+        self.sawtooth_pipeline_capacity = 1
+        self.sawtooth_split_prefill_tail = False
+        # Per-schedule decisions: split this tail, or reserve its other partner.
+        self._sawtooth_tail_candidates: dict[str, bool] = {}
         self.sawtooth_allow_early_admission = False
+        self.sawtooth_defer_dependent_decode = False
         self.sawtooth_decode_only = False
         self.sawtooth_prefill_only = False
         # Match V2's fixed prefill_len, including output replay after preemption.
@@ -573,13 +578,25 @@ class Scheduler(SchedulerInterface):
     def sawtooth_can_schedule(self, request: Request) -> bool:
         if not request.num_in_flight_tokens:
             return True
+        if self.sawtooth_defer_dependent_decode and self._sawtooth_is_decode(
+            request, 1
+        ):
+            # A pending sampled token must not gate an otherwise ready P batch.
+            return False
         return bool(
-            self.sawtooth_allow_early_admission
+            (
+                self.sawtooth_allow_early_admission
+                or self.sawtooth_request_ledger.can_overlap_prefill(request.request_id)
+            )
             and not request.is_finished()
             and not request.use_structured_output
             and not request.resumable
             and self.sawtooth_request_ledger.can_advance(request.request_id)
         )
+
+    def sawtooth_mark_head_enqueued(self, output: SchedulerOutput) -> None:
+        for step in (output.sawtooth_request_steps or {}).values():
+            self.sawtooth_request_ledger.mark_head_enqueued(step)
 
     def sawtooth_mark_tail_enqueued(self, output: SchedulerOutput) -> None:
         for step in (output.sawtooth_request_steps or {}).values():
@@ -629,21 +646,107 @@ class Scheduler(SchedulerInterface):
             for request in self.running
         )
 
-    def sawtooth_has_prefill_candidate(self) -> bool:
+    def sawtooth_has_prefill_candidate(self, *, require_eligible: bool = False) -> bool:
         """A waiting P may still be blocked; one native admission may try it."""
         if not self.sawtooth_enabled:
             return False
         if self._pause_state == PauseState.PAUSED_ALL:
             return False
-        if self._pause_state == PauseState.UNPAUSED and (
-            self.waiting or self.skipped_waiting
-        ):
-            return True
+        if self._pause_state == PauseState.UNPAUSED:
+            if not require_eligible and (self.waiting or self.skipped_waiting):
+                return True
+            if require_eligible and (
+                len(self.running) + self.num_waiting_for_streaming_input
+                < self.max_num_running_reqs
+            ):
+                for queue in (self.waiting, self.skipped_waiting):
+                    if any(
+                        request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                        and not request.num_in_flight_tokens
+                        and not (
+                            request.num_stale_output_tokens > 0
+                            and not request.drop_stale_output
+                        )
+                        for request in queue
+                    ):
+                        return True
         for request in self.running:
             count = self._sawtooth_running_tokens(request, self.current_step + 1)
             if count and not self._sawtooth_is_decode(request, count):
                 return True
         return False
+
+    def _sawtooth_split_tail_tokens(
+        self, request: Request, start: int, count: int, scheduled: dict[str, int]
+    ) -> int:
+        """Split a final interval only when the new cohort has no partner."""
+        if (
+            not self.sawtooth_enabled
+            or not self.sawtooth_split_prefill_tail
+            or not self.sawtooth_request_ledger.allow_prefill_overlap
+            or self.sawtooth_decode_only
+            # Preserve normal packing when this batch already contains work.
+            # A tail inside a populated batch is not an isolated batch.
+            or bool(scheduled)
+            or count < 2
+            or not self.scheduler_config.enable_chunked_prefill
+            or self.need_mamba_block_aligned_split
+            or self.num_prefill_lookahead
+            or self.num_spec_tokens
+            or self.connector is not None
+            or request.has_encoder_inputs
+            or request.use_structured_output
+            or request.resumable
+            or request.num_output_tokens
+            or self.sawtooth_request_ledger.has_split_tail(request.request_id)
+        ):
+            return count
+        prefill_end = self._sawtooth_prefill_lens.get(
+            request.request_id, request.num_prompt_tokens
+        )
+        if start + count != prefill_end:
+            return count
+
+        # Include in-flight requests with unscheduled prefill: retirement can
+        # make them eligible before this cohort's continuations are submitted.
+        for other in self.running:
+            if other is request or other.is_finished():
+                continue
+            other_end = self._sawtooth_prefill_lens.get(
+                other.request_id, other.num_prompt_tokens
+            )
+            if (
+                other.num_computed_tokens + scheduled.get(other.request_id, 0)
+                < other_end
+            ):
+                self._sawtooth_tail_candidates[request.request_id] = False
+                return count
+        if (
+            self._pause_state == PauseState.UNPAUSED
+            and len(self.running)
+            + self.num_waiting_for_streaming_input
+            + int(request not in self.running)
+            < self.max_num_running_reqs
+        ):
+            for queue in (self.waiting, self.skipped_waiting):
+                for other in queue:
+                    if (
+                        other is not request
+                        and other.status
+                        in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                        and not other.num_in_flight_tokens
+                        and other.num_computed_tokens < other.num_prompt_tokens
+                        and not (
+                            other.num_stale_output_tokens > 0
+                            and not other.drop_stale_output
+                        )
+                    ):
+                        self._sawtooth_tail_candidates[request.request_id] = False
+                        return count
+
+        # Commit the marker only if allocation actually admits this request.
+        self._sawtooth_tail_candidates[request.request_id] = True
+        return (count + 1) // 2
 
     def _sawtooth_request_cap(self, defer_prefills: bool) -> int:
         """Leave independent requests for the other free pipeline slots.
@@ -653,6 +756,22 @@ class Scheduler(SchedulerInterface):
         set back into one batch. This is a request cap, not a token cap: long
         prefill chunks retain the configured token budget.
         """
+        if self.sawtooth_enabled and self.sawtooth_pipeline_capacity > 1:
+            live = [request for request in self.running if not request.is_finished()]
+            if (
+                live
+                and not (self.waiting or self.skipped_waiting)
+                and all(self._sawtooth_is_decode(request, 1) for request in live)
+            ):
+                # Extra in-flight slots stage successors, not smaller cohorts.
+                # Include in-flight requests to keep the cap stable on refill.
+                groups = min(
+                    self.parallel_config.pipeline_parallel_size,
+                    self.sawtooth_pipeline_capacity,
+                )
+                return min(
+                    self.max_num_running_reqs, (len(live) + groups - 1) // groups
+                )
         slots = self.sawtooth_available_batches
         if not self.sawtooth_enabled or (
             slots <= 1 and not (self.sawtooth_decode_only or self.sawtooth_prefill_only)
@@ -706,6 +825,7 @@ class Scheduler(SchedulerInterface):
         return max(1, (eligible + slots - 1) // slots)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self._sawtooth_tail_candidates.clear()
         if self.sawtooth_decode_only or self.sawtooth_prefill_only:
             if not self.sawtooth_enabled:
                 raise ValueError("Sawtooth selection requires sawtooth scheduling")
@@ -877,6 +997,9 @@ class Scheduler(SchedulerInterface):
             # num_prefill_lookahead of the prefill end.
             num_new_tokens = self._reserve_prefill_lookahead(
                 request, request.num_computed_tokens, num_new_tokens
+            )
+            num_new_tokens = self._sawtooth_split_tail_tokens(
+                request, request.num_computed_tokens, num_new_tokens, num_scheduled_tokens
             )
 
             if num_new_tokens == 0:
@@ -1316,6 +1439,9 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = self._reserve_prefill_lookahead(
                         request, num_computed_tokens, num_new_tokens
                     )
+                    num_new_tokens = self._sawtooth_split_tail_tokens(
+                        request, num_computed_tokens, num_new_tokens, num_scheduled_tokens
+                    )
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
@@ -1743,6 +1869,7 @@ class Scheduler(SchedulerInterface):
                     self.requests[rid].num_computed_tokens + count
                     >= self.requests[rid].num_tokens
                     + self.requests[rid].num_output_placeholders,
+                    split_tail=self._sawtooth_tail_candidates.get(rid, False),
                 )
                 for rid, count in num_scheduled_tokens.items()
             }

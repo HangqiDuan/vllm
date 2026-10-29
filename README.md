@@ -1,3 +1,5 @@
+> Experimental Sawtooth prefill snapshot: see [SAWTOOTH.md](SAWTOOTH.md) for the paired repositories, setup, and validation limits.
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
