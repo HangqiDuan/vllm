@@ -105,6 +105,17 @@ class SawtoothRequestLedger:
             and state.head_enqueued == state.live[-1].step_id
         )
 
+    def has_enqueued_final_prefill(self, request_id: str, end: int) -> bool:
+        state = self.requests.get(request_id)
+        return bool(
+            self.allow_prefill_overlap
+            and state is not None
+            and state.live
+            and state.live[-1].produces_sample
+            and state.live[-1].token_end == end
+            and state.head_enqueued == state.live[-1].step_id
+        )
+
     def has_split_tail(self, request_id: str) -> bool:
         state = self.requests.get(request_id)
         return state is not None and state.tail_split

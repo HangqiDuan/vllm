@@ -895,3 +895,61 @@ def test_prefill_boundary_reuses_only_a_finishing_requests_kv(
         assert req.num_preemptions == 0
         assert req.request_id not in sched.requests
     assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == 3999
+
+
+@pytest.mark.parametrize("capacity", [2, 3])
+@pytest.mark.parametrize("max_tokens,num_blocks", [(1, 270), (1, 250), (4, 270)])
+def test_next_prefill_head_overlaps_a_full_finishing_batch(
+    admission_scheduler, capacity, max_tokens, num_blocks
+):
+    # Only A's full prompt + B's first chunk fit. B must enter before A retires.
+    engine, sched, executor, request = _tail_engine(
+        admission_scheduler,
+        3072,
+        capacity=capacity,
+        num_blocks=num_blocks,
+        max_tokens=max_tokens,
+    )
+    sched.scheduler_reserve_full_isl = True
+    for _ in range(20):
+        engine.step()
+        final = next(
+            (
+                o
+                for o in executor.commands
+                if o.sawtooth_execution.is_first_round
+                and o.sawtooth_request_steps[request.request_id].produces_sample
+            ),
+            None,
+        )
+        if final is not None:
+            break
+    assert final is not None
+    assert request.num_output_tokens == 0
+    (partner,) = create_requests(1, num_tokens=3072, max_tokens=1, req_ids=["partner"])
+    sched.add_request(partner)
+    before = len(executor.commands)
+    admitted = False
+    for _ in range(20):
+        engine.step()
+        heads = [
+            o for o in executor.commands[before:] if o.sawtooth_execution.is_first_round
+        ]
+        if any(o.num_scheduled_tokens == {"partner": 1024} for o in heads):
+            admitted = request.num_output_tokens == 0
+            break
+        if request.num_output_tokens:
+            break
+    assert admitted == (max_tokens == 1 and num_blocks == 270)
+    if admitted:
+        a_blocks = sched.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+        b_blocks = sched.kv_cache_manager.get_blocks(partner.request_id).blocks[0]
+        assert all(block.ref_cnt > 0 for block in a_blocks)
+        assert {b.block_id for b in a_blocks}.isdisjoint(b.block_id for b in b_blocks)
+    _drain_tail_engine(engine, sched)
+    for req, expected in [(request, max_tokens), (partner, 1)]:
+        assert req.num_output_tokens == expected
+        assert req.num_preemptions == 0
+        assert req.num_in_flight_tokens == 0
+        assert req.request_id not in sched.requests
+    assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == num_blocks - 1

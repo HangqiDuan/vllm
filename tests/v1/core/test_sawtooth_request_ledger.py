@@ -84,3 +84,19 @@ def test_wrong_or_repeated_tail_identity_is_rejected():
     ledger.mark_tail_enqueued(step)
     with pytest.raises(RuntimeError, match="terminal submission"):
         ledger.mark_tail_enqueued(step)
+
+
+def test_final_prefill_admission_credit_requires_a_live_submitted_head():
+    ledger = SawtoothRequestLedger()
+    ledger.allow_prefill_overlap = True
+    step = ledger.admit("a", 0, 1024, True)
+    assert not ledger.has_enqueued_final_prefill("a", 1024)
+    ledger.mark_head_enqueued(step)
+    assert ledger.has_enqueued_final_prefill("a", 1024)
+    assert not ledger.has_enqueued_final_prefill("a", 2048)
+    ledger.allow_prefill_overlap = False
+    assert not ledger.has_enqueued_final_prefill("a", 1024)
+    ledger.allow_prefill_overlap = True
+    ledger.mark_tail_enqueued(step)
+    ledger.settle(step, 0)
+    assert not ledger.has_enqueued_final_prefill("a", 1024)
