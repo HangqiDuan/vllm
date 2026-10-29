@@ -767,6 +767,24 @@ class Scheduler(SchedulerInterface):
             has_tail |= start > 0 and start + count == end
         return has_tail
 
+    def _sawtooth_finishing_prefill(self, scheduled: dict[str, int]) -> bool:
+        if (
+            len(self.running) != 1
+            or len(scheduled) != 1
+            or self.num_waiting_for_streaming_input
+            or self.connector is not None
+            or not self._sawtooth_can_pack_prefill_tail(scheduled)
+        ):
+            return False
+        request = self.running[0]
+        return (
+            request.request_id in scheduled
+            and request.max_tokens == 1
+            and not request.num_output_tokens
+            and not request.resumable
+            and not request.use_structured_output
+        )
+
     def _sawtooth_request_cap(self, defer_prefills: bool) -> int:
         """Leave independent requests for the other free pipeline slots.
 
@@ -1514,7 +1532,12 @@ class Scheduler(SchedulerInterface):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async or self.sawtooth_enabled,
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    # This sole request finishes in the shared batch. Its KV
+                    # is released before the new request needs its full prompt.
+                    full_sequence_must_fit=(
+                        self.scheduler_reserve_full_isl
+                        and not self._sawtooth_finishing_prefill(num_scheduled_tokens)
+                    ),
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                 )
