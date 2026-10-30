@@ -125,7 +125,7 @@ def _drain_tail_engine(engine, sched):
     "length,counts",
     [
         (7168, [1024] * 6 + [512, 512]),
-        (3072, [1024, 1024, 512, 512]),
+        (3072, [1024] * 2 + [512, 512]),
         (4096, [1024] * 4),
         (2548, [1024, 1024, 250, 250]),
         (2549, [1024, 1024, 251, 250]),
@@ -771,3 +771,224 @@ def test_short_tail_fills_remaining_budget_before_final_tail_split(
     assert {request.request_id: 4179, "partner": 6061} in heads
     assert heads[-2:] == [{"partner": 4179}, {"partner": 4179}]
     assert sum(sum(h.values()) for h in heads) == 2 * 65619
+
+
+@pytest.mark.parametrize("capacity", [2, 3])
+@pytest.mark.parametrize("arrival_step", [0, 1, 2, 3, 4, 5])
+def test_two_50k_prefills_pack_boundary_before_splitting_unpaired_tail(
+    admission_scheduler, tmp_path, capacity, arrival_step
+):
+    # A prompt boundary must not leave half of a prefill batch unused.
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["max_position_embeddings"] = 131072
+    config_path.write_text(json.dumps(config))
+
+    def configured(**kwargs):
+        kwargs["max_num_batched_tokens"] = 20480
+        return admission_scheduler(**kwargs)
+
+    engine, sched, executor, request = _tail_engine(
+        configured,
+        51200,
+        capacity=capacity,
+        max_model_len=131072,
+        num_blocks=20000,
+    )
+    for _ in range(arrival_step):
+        engine.step()
+    (partner,) = create_requests(
+        1, num_tokens=51200, max_tokens=1, req_ids=["partner"]
+    )
+    sched.add_request(partner)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    batches = [o.num_scheduled_tokens for o in heads]
+    # Early admission can give the final full chunk a live cohort partner.
+    paired_tail = capacity == 3 and arrival_step < 3
+    expected = [20480] * 5 if paired_tail else [20480] * 4 + [10240, 10240]
+    assert [sum(b.values()) for b in batches] == expected, batches
+    assert {request.request_id: 10240, partner.request_id: 10240} in batches
+    for req in (request, partner):
+        end = 0
+        for out in heads:
+            if req.request_id not in out.num_scheduled_tokens:
+                continue
+            step = out.sawtooth_request_steps[req.request_id]
+            assert step.token_start == end
+            end = step.token_end
+        assert end == 51200
+        assert req.num_in_flight_tokens == 0
+        assert req.num_output_tokens == 1
+        assert req.request_id not in sched.requests
+
+
+@pytest.mark.parametrize("limits", [{"max_num_seqs": 1}, {"num_blocks": 3500}])
+def test_prefill_tail_packing_preserves_resource_admission(
+    admission_scheduler, tmp_path, limits
+):
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["max_position_embeddings"] = 131072
+    config_path.write_text(json.dumps(config))
+
+    def configured(**kwargs):
+        kwargs["max_num_batched_tokens"] = 20480
+        kwargs.update(limits)
+        return admission_scheduler(**kwargs)
+
+    engine, sched, executor, request = _tail_engine(
+        configured, 51200, capacity=3, max_model_len=131072
+    )
+    for _ in range(5):
+        engine.step()
+    (partner,) = create_requests(
+        1, num_tokens=51200, max_tokens=1, req_ids=["partner"]
+    )
+    sched.add_request(partner)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert all(o.total_num_scheduled_tokens <= 20480 for o in heads)
+    assert all(len(o.num_scheduled_tokens) == 1 for o in heads)
+    for req in (request, partner):
+        assert sum(
+            o.num_scheduled_tokens.get(req.request_id, 0) for o in heads
+        ) == 51200
+        assert req.num_output_tokens == 1
+        assert req.num_in_flight_tokens == 0
+        assert req.request_id not in sched.requests
+
+
+@pytest.mark.parametrize("max_tokens", [1, 4])
+def test_prefill_boundary_reuses_only_a_finishing_requests_kv(
+    admission_scheduler, tmp_path, max_tokens
+):
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["max_position_embeddings"] = 131072
+    config_path.write_text(json.dumps(config))
+
+    def configured(**kwargs):
+        kwargs["max_num_batched_tokens"] = 20480
+        return admission_scheduler(**kwargs)
+
+    engine, sched, executor, request = _tail_engine(
+        configured, 51200, capacity=3, max_tokens=max_tokens,
+        max_model_len=131072, num_blocks=4000,
+    )
+    sched.scheduler_reserve_full_isl = True
+    for _ in range(5):
+        engine.step()
+    (partner,) = create_requests(
+        1, num_tokens=51200, max_tokens=max_tokens, req_ids=["partner"]
+    )
+    sched.add_request(partner)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    mixed = {request.request_id: 10240, partner.request_id: 10240}
+    if max_tokens == 1:
+        assert mixed in [o.num_scheduled_tokens for o in heads]
+        assert [o.total_num_scheduled_tokens for o in heads] == [20480] * 5
+    else:
+        # A retains KV for decode: preserve full-input admission policy for B.
+        assert all(len(o.num_scheduled_tokens) == 1 for o in heads)
+    for req in (request, partner):
+        assert req.num_output_tokens == max_tokens
+        assert req.num_in_flight_tokens == 0
+        assert req.num_preemptions == 0
+        assert req.request_id not in sched.requests
+    assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == 3999
+
+
+@pytest.mark.parametrize("capacity", [2, 3])
+@pytest.mark.parametrize("max_tokens,num_blocks", [(1, 270), (1, 250), (4, 270)])
+def test_next_prefill_head_overlaps_a_full_finishing_batch(
+    admission_scheduler, capacity, max_tokens, num_blocks
+):
+    # Only A's full prompt + B's first chunk fit. B must enter before A retires.
+    engine, sched, executor, request = _tail_engine(
+        admission_scheduler,
+        3072,
+        capacity=capacity,
+        num_blocks=num_blocks,
+        max_tokens=max_tokens,
+    )
+    sched.scheduler_reserve_full_isl = True
+    for _ in range(20):
+        engine.step()
+        final = next(
+            (
+                o
+                for o in executor.commands
+                if o.sawtooth_execution.is_first_round
+                and o.sawtooth_request_steps[request.request_id].produces_sample
+            ),
+            None,
+        )
+        if final is not None:
+            break
+    assert final is not None
+    assert request.num_output_tokens == 0
+    (partner,) = create_requests(1, num_tokens=3072, max_tokens=1, req_ids=["partner"])
+    sched.add_request(partner)
+    before = len(executor.commands)
+    admitted = False
+    for _ in range(20):
+        engine.step()
+        heads = [
+            o for o in executor.commands[before:] if o.sawtooth_execution.is_first_round
+        ]
+        if any(o.num_scheduled_tokens == {"partner": 1024} for o in heads):
+            admitted = request.num_output_tokens == 0
+            break
+        if request.num_output_tokens:
+            break
+    assert admitted == (max_tokens == 1 and num_blocks == 270)
+    if admitted:
+        a_blocks = sched.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+        b_blocks = sched.kv_cache_manager.get_blocks(partner.request_id).blocks[0]
+        assert all(block.ref_cnt > 0 for block in a_blocks)
+        assert {b.block_id for b in a_blocks}.isdisjoint(b.block_id for b in b_blocks)
+    _drain_tail_engine(engine, sched)
+    for req, expected in [(request, max_tokens), (partner, 1)]:
+        assert req.num_output_tokens == expected
+        assert req.num_preemptions == 0
+        assert req.num_in_flight_tokens == 0
+        assert req.request_id not in sched.requests
+    assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == num_blocks - 1
+
+
+@pytest.mark.parametrize("length", [51200, 61440, 71680])
+def test_only_unpaired_final_full_batch_splits(admission_scheduler, tmp_path, length):
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["max_position_embeddings"] = 131072
+    config_path.write_text(json.dumps(config))
+
+    def configured(**kwargs):
+        kwargs["max_num_batched_tokens"] = 20480
+        return admission_scheduler(**kwargs)
+
+    engine, sched, executor, request = _tail_engine(
+        configured, length, capacity=3, max_model_len=131072, num_blocks=6000
+    )
+    sched.scheduler_reserve_full_isl = True
+    (partner,) = create_requests(1, num_tokens=length, max_tokens=1, req_ids=["B"])
+    sched.add_request(partner)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    totals = [o.total_num_scheduled_tokens for o in heads]
+    # 60k x 2 already pairs all six full batches. 50k/70k end with a lone batch.
+    expected = (
+        [20480] * (length // 10240 - 1) + [10240, 10240]
+        if length != 61440
+        else [20480] * 6
+    )
+    assert totals == expected
+    assert sum(totals) == length * 2
+    for req in (request, partner):
+        assert req.num_output_tokens == 1
+        assert req.num_preemptions == 0
+        assert req.num_in_flight_tokens == 0
+        assert req.request_id not in sched.requests
+    assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == 5999
