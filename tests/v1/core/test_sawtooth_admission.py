@@ -127,6 +127,8 @@ def _drain_tail_engine(engine, sched):
         (7168, [1024] * 6 + [512, 512]),
         (3072, [1024] * 2 + [512, 512]),
         (4096, [1024] * 4),
+        (6144, [1024] * 6),
+        (6656, [1024] * 6 + [256, 256]),
         (2548, [1024, 1024, 250, 250]),
         (2549, [1024, 1024, 251, 250]),
         (2051, [1024, 1024, 2, 1]),
@@ -357,9 +359,9 @@ def test_failed_split_submission_does_not_publish_tokens_or_release_kv(
 
 
 @pytest.mark.parametrize(
-    "length,counts", [(3072, [1024, 1024]), (4096, [1024, 1024, 512, 512])]
+    "length,counts", [(3072, [1024, 1024]), (4096, [1024, 1024, 1024])]
 )
-def test_tail_pairing_uses_live_cohort_instead_of_original_prompt_parity(
+def test_even_tail_stays_whole_after_an_earlier_chunk_completed_alone(
     admission_scheduler, length, counts
 ):
     engine, sched, executor, request = _tail_engine(admission_scheduler, length)
@@ -992,3 +994,61 @@ def test_only_unpaired_final_full_batch_splits(admission_scheduler, tmp_path, le
         assert req.num_in_flight_tokens == 0
         assert req.request_id not in sched.requests
     assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == 5999
+
+
+@pytest.mark.parametrize("warmup_length", [1, 3072])
+def test_tail_parity_resets_between_drained_request_groups(
+    admission_scheduler, warmup_length
+):
+    engine, sched, executor, _ = _tail_engine(admission_scheduler, warmup_length)
+    _drain_tail_engine(engine, sched)
+    executor.commands.clear()
+    (request,) = create_requests(1, num_tokens=6144, max_tokens=1, req_ids=["next"])
+    sched.add_request(request)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert [o.total_num_scheduled_tokens for o in heads] == [1024] * 6
+    assert request.num_output_tokens == 1
+
+
+@pytest.mark.parametrize("arrival_step", [0, 1, 2, 3, 4, 5])
+def test_two_three_chunk_prompts_keep_six_full_batches(
+    admission_scheduler, arrival_step
+):
+    engine, sched, executor, request = _tail_engine(admission_scheduler, 3072)
+    for _ in range(arrival_step):
+        engine.step()
+    (partner,) = create_requests(1, num_tokens=3072, max_tokens=1, req_ids=["B"])
+    sched.add_request(partner)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert [o.total_num_scheduled_tokens for o in heads] == [1024] * 6
+    for req in (request, partner):
+        assert req.num_output_tokens == 1
+        assert req.num_in_flight_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "length,counts",
+    [(61440, [10240] * 6), (65536, [10240] * 6 + [2048, 2048])],
+)
+def test_mbt10k_keeps_six_chunks_and_splits_seventh_tail(
+    admission_scheduler, tmp_path, length, counts
+):
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["max_position_embeddings"] = 131072
+    config_path.write_text(json.dumps(config))
+
+    def configured(**kwargs):
+        kwargs["max_num_batched_tokens"] = 10240
+        return admission_scheduler(**kwargs)
+
+    engine, sched, executor, request = _tail_engine(
+        configured, length, max_model_len=131072, num_blocks=10000
+    )
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert [o.total_num_scheduled_tokens for o in heads] == counts
+    assert sum(counts) == length
+    assert request.num_output_tokens == 1

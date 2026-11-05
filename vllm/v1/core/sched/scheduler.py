@@ -102,6 +102,7 @@ class Scheduler(SchedulerInterface):
         self.sawtooth_available_batches = 1
         self.sawtooth_pipeline_capacity = 1
         self.sawtooth_split_prefill_tail = False
+        self._sawtooth_prefill_batches = 0
         # Per-schedule decisions: split this tail, or reserve its other partner.
         self._sawtooth_tail_candidates: dict[str, bool] = {}
         self.sawtooth_allow_early_admission = False
@@ -709,10 +710,12 @@ class Scheduler(SchedulerInterface):
     def _sawtooth_split_tail_tokens(
         self, request: Request, start: int, count: int, scheduled: dict[str, int]
     ) -> int:
-        """Split a final interval only when the new cohort has no partner."""
+        """Split only an odd final prefill batch with no live partner."""
         if (
             not self.sawtooth_enabled
             or not self.sawtooth_split_prefill_tail
+            # Preserve even-numbered heads across cohort boundaries.
+            or self._sawtooth_prefill_batches % 2 == 1
             or not self.sawtooth_request_ledger.allow_prefill_overlap
             or self.sawtooth_decode_only
             # Preserve normal packing when this batch already contains work.
@@ -2025,6 +2028,13 @@ class Scheduler(SchedulerInterface):
                 self._sawtooth_is_decode(self.requests[rid], count)
                 for rid, count in num_scheduled_tokens.items()
             )
+            # Count accepted prefill heads, including packed batches, once.
+            # Empty probes, decode and virtual continuations do not advance parity.
+            if any(
+                not self._sawtooth_is_decode(self.requests[rid], count)
+                for rid, count in num_scheduled_tokens.items()
+            ):
+                self._sawtooth_prefill_batches += 1
             scheduler_output.sawtooth_request_steps = {
                 rid: self.sawtooth_request_ledger.admit(
                     rid,
@@ -3195,6 +3205,8 @@ class Scheduler(SchedulerInterface):
             self._sawtooth_prefill_lens.pop(request.request_id, None)
         self._free_request_blocks(request)
         del self.requests[request.request_id]
+        if self.sawtooth_enabled and not self.requests:
+            self._sawtooth_prefill_batches = 0
 
     @property
     def pause_state(self) -> PauseState:
