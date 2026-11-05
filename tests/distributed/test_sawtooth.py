@@ -131,3 +131,14 @@ def test_pcp4_tp1_pp2_capability_is_supported(pcp, tp, pp):
     else:
         with pytest.raises(ValueError, match="PCP outside"):
             validate_sawtooth_capabilities(config)
+
+
+def test_sas_metadata_reuse_is_explicit_and_requires_boolean():
+    from types import SimpleNamespace
+    from vllm.distributed.sawtooth import SawtoothConfig
+    import pytest
+    assert not SawtoothConfig().enable_sas_metadata_reuse
+    config = SimpleNamespace(additional_config={"sawtooth_pipeline": {"enable_sas_metadata_reuse": True}})
+    assert SawtoothConfig.from_vllm_config(config).enable_sas_metadata_reuse
+    with pytest.raises(ValueError):
+        SawtoothConfig(enable_sas_metadata_reuse="true")
