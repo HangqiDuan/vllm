@@ -1228,12 +1228,14 @@ def get_max_concurrency_for_kv_cache_config(
 
 
 def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
-    """Override the number of kv cache blocks if `num_gpu_blocks_override` is set.
+    """
+    Override the number of kv cache blocks if `num_gpu_blocks_override` is set.
+    Round down to a multiple of four after applying the optional override.
     The override is logged once, at the call site in `get_kv_cache_configs`.
     """
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         num_blocks = vllm_config.cache_config.num_gpu_blocks_override
-    return num_blocks
+    return num_blocks // 4 * 4
 
 
 def _pool_bytes_per_block(
@@ -2623,6 +2625,15 @@ def get_kv_cache_configs(
             )
             adjusted_memory.append(override * bytes_per_block)
         available_memory = adjusted_memory
+
+    # Plan admission and allocation against the same four-block-aligned pool.
+    available_memory = [
+        may_override_num_blocks(vllm_config, avail_mem // _pool_bytes_per_block(groups))
+        * _pool_bytes_per_block(groups)
+        if groups
+        else avail_mem
+        for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
+    ]
 
     # Reserve the null block BlockPool permanently holds back, so auto-fit and
     # the capacity check both plan against usable blocks. Allocation below
