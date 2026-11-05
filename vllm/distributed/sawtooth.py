@@ -210,11 +210,17 @@ def validate_sawtooth_capabilities(
     parallel = vllm_config.parallel_config
     for field, label in (
         ("data_parallel_size", "data parallelism"),
-        ("prefill_context_parallel_size", "PCP"),
         ("decode_context_parallel_size", "DCP"),
     ):
         if getattr(parallel, field, 1) > 1:
             unsupported.append(label)
+    if getattr(parallel, "prefill_context_parallel_size", 1) > 1:
+        if (
+            parallel.prefill_context_parallel_size != 4
+            or parallel.tensor_parallel_size != 1
+            or parallel.pipeline_parallel_size != 2
+        ):
+            unsupported.append("PCP outside PP2/PCP4/TP1")
     if getattr(parallel, "enable_dbo", False):
         unsupported.append("DBO")
     for field, label in (
