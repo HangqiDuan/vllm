@@ -327,7 +327,7 @@ def test_strict_decode_skips_waiting_path_and_keeps_full_budget(
     def forbidden(*args, **kwargs):
         pytest.fail("decode-only accessed waiting promotion/prefix lookup")
 
-    monkeypatch.setattr(sched, "_try_promote_blocked_waiting_request", forbidden)
+    monkeypatch.setattr(sched, "_handle_blocked_waiting_request", forbidden)
     monkeypatch.setattr(sched, "_get_local_prefix_cache_hit", forbidden)
     fresh.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
     before = sched.current_step
@@ -352,7 +352,7 @@ def test_candidate_hint_is_read_only_and_shares_final_token_guard(
         pytest.fail("candidate hint allocated or promoted a request")
 
     monkeypatch.setattr(sched.kv_cache_manager, "allocate_slots", forbidden)
-    monkeypatch.setattr(sched, "_try_promote_blocked_waiting_request", forbidden)
+    monkeypatch.setattr(sched, "_handle_blocked_waiting_request", forbidden)
     before = (sched.current_step, [r.num_in_flight_tokens for r in requests])
     assert not sched.sawtooth_has_decode_candidate()
     assert sched.sawtooth_has_prefill_candidate()

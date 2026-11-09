@@ -149,7 +149,7 @@ class SawtoothEngine:
             return scheduler.sawtooth_has_decode_candidate()
         if scheduler.sawtooth_prefill_only:
             return scheduler.sawtooth_has_prefill_candidate()
-        return bool(scheduler.waiting or scheduler.skipped_waiting) or any(
+        return bool(scheduler.waiting or scheduler.kv_holding_waiting) or any(
             scheduler.sawtooth_can_schedule(req) and not req.is_finished()
             for req in scheduler.running
         )

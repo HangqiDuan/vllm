@@ -98,7 +98,9 @@ def test_special_inputs_keep_original_hashing(kind):
     make(tokens, cached)
     kwargs = {}
     if kind == "lora":
-        kwargs['lora_request'] = SimpleNamespace(lora_name="adapter")
+        kwargs["lora_request"] = SimpleNamespace(
+            lora_name="adapter", lora_path="/test/adapter"
+        )
     elif kind == "multimodal":
         kwargs['mm_features'] = [SimpleNamespace(identifier="image-a",
             mm_position=SimpleNamespace(offset=0, length=4))]
@@ -108,7 +110,10 @@ def test_special_inputs_keep_original_hashing(kind):
             kwargs['prompt_is_token_ids'] = [True,False]*4
     for _ in range(2):
         before = counter.calls
-        assert make(tokens,cached,**kwargs).block_hashes == make(tokens,plain,**kwargs).block_hashes
+        assert (
+            make(tokens, cached, **kwargs).block_hashes
+            == make(tokens, plain, **kwargs).block_hashes
+        )
         assert counter.calls-before == 4
 
 
@@ -118,7 +123,8 @@ def test_default_disabled_and_limit_smaller_than_block():
         counter = CountingHash()
         kwargs = {} if limit is None else {'max_cached_prompt_tokens':limit}
         hasher = utils.get_request_block_hasher(2,counter,**kwargs)
-        make(range(8),hasher); make(range(8),hasher)
+        make(range(8), hasher)
+        make(range(8), hasher)
         assert counter.calls == 8
 
 
@@ -136,7 +142,8 @@ def test_long_prefix_comparison_windows(change):
 
 def test_nondivisible_cap_and_partial_matching_block():
     cached,plain,counter=setup_cache(limit=10,block_size=3)
-    tokens=list(range(15));make(tokens,cached)
+    tokens = list(range(15))
+    make(tokens, cached)
     tokens[8]=-1
     before=counter.calls
     assert make(tokens,cached).block_hashes == make(tokens,plain).block_hashes
@@ -150,7 +157,8 @@ def test_short_prompt_first_generated_block_is_not_cached():
     cached,plain,counter=setup_cache(block_size=4)
     a,b=make([1],cached),make([1],plain)
     for tok in [2,3,4]:
-        a.append_output_token_ids(tok);b.append_output_token_ids(tok)
+        a.append_output_token_ids(tok)
+        b.append_output_token_ids(tok)
     assert a.block_hashes==b.block_hashes
     before=counter.calls
     assert make([1,2,3,4],cached).block_hashes==make([1,2,3,4],plain).block_hashes
@@ -158,23 +166,29 @@ def test_short_prompt_first_generated_block_is_not_cached():
 
 
 def test_concurrent_snapshot_replacements_preserve_exact_hashes():
-    from concurrent.futures import ThreadPoolExecutor
     import threading
+    from concurrent.futures import ThreadPoolExecutor
     utils.init_none_hash(sha256)
-    gate=threading.Barrier(2);local=threading.local()
+    gate = threading.Barrier(2)
+    local = threading.local()
+
     def hash_fn(value):
         if getattr(local,'wait',False):
-            local.wait=False;gate.wait(timeout=10)
+            local.wait = False
+            gate.wait(timeout=10)
         return sha256(value)
     cached=utils.get_request_block_hasher(2,hash_fn,max_cached_prompt_tokens=10000)
     plain=utils.get_request_block_hasher(2,sha256)
-    base=list(range(10000));make(base,cached)
+    base = list(range(10000))
+    make(base, cached)
+
     def run(last):
         local.wait=True
         tokens=base[:-1]+[last]
         return make(tokens,cached).block_hashes
     with ThreadPoolExecutor(max_workers=2) as pool:
-        a=pool.submit(run,-1);b=pool.submit(run,-2)
+        a = pool.submit(run, -1)
+        b = pool.submit(run, -2)
         assert a.result()==make(base[:-1]+[-1],plain).block_hashes
         assert b.result()==make(base[:-1]+[-2],plain).block_hashes
     assert make(base,cached).block_hashes==make(base,plain).block_hashes

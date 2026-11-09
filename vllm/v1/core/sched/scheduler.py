@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import heapq
 import itertools
 import time
 from collections import defaultdict, deque
@@ -689,15 +688,16 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             return False
         if self._pause_state == PauseState.UNPAUSED:
-            if not require_eligible and (self.waiting or self.skipped_waiting):
+            if not require_eligible and (self.waiting or self.kv_holding_waiting):
                 return True
             if require_eligible and (
                 len(self.running) + self.num_waiting_for_streaming_input
                 < self.max_num_running_reqs
             ):
-                for queue in (self.waiting, self.skipped_waiting):
+                for queue in (self.waiting, self.kv_holding_waiting):
                     if any(
-                        request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                        request.status
+                        in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
                         and not request.num_in_flight_tokens
                         and not (
                             request.num_stale_output_tokens > 0
@@ -751,12 +751,8 @@ class Scheduler(SchedulerInterface):
             - self.num_waiting_for_streaming_input
         )
         seen: set[str] = set()
-        # Match _select_waiting_queue_for_scheduling without mutating queues.
-        waiting = (
-            itertools.chain(self.skipped_waiting, self.waiting)
-            if self.policy == SchedulingPolicy.FCFS
-            else heapq.merge(self.skipped_waiting, self.waiting)
-        )
+        # Drain KV-holding waiters before admitting new requests.
+        waiting = itertools.chain(self.kv_holding_waiting, self.waiting)
         for request in itertools.chain(self.running, waiting):
             if request.request_id in seen:
                 continue
@@ -899,7 +895,7 @@ class Scheduler(SchedulerInterface):
             + int(request not in self.running)
             < self.max_num_running_reqs
         ):
-            for queue in (self.waiting, self.skipped_waiting):
+            for queue in (self.waiting, self.kv_holding_waiting):
                 for other in queue:
                     if (
                         other is not request
@@ -982,7 +978,7 @@ class Scheduler(SchedulerInterface):
             live = [request for request in self.running if not request.is_finished()]
             if (
                 live
-                and not (self.waiting or self.skipped_waiting)
+                and not (self.waiting or self.kv_holding_waiting)
                 and all(self._sawtooth_is_decode(request, 1) for request in live)
             ):
                 # Extra in-flight slots stage successors, not smaller cohorts.
@@ -1018,7 +1014,7 @@ class Scheduler(SchedulerInterface):
             - len(self.running)
             - self.num_waiting_for_streaming_input,
         )
-        for queue in (self.skipped_waiting, self.waiting):
+        for queue in (self.kv_holding_waiting, self.waiting):
             if self.sawtooth_decode_only or waiting_capacity == 0:
                 break
             for request in queue:
@@ -1254,7 +1250,10 @@ class Scheduler(SchedulerInterface):
                 request, request.num_computed_tokens, num_new_tokens
             )
             num_new_tokens = self._sawtooth_split_tail_tokens(
-                request, request.num_computed_tokens, num_new_tokens, num_scheduled_tokens
+                request,
+                request.num_computed_tokens,
+                num_new_tokens,
+                num_scheduled_tokens,
             )
 
             if num_new_tokens == 0:
@@ -1451,8 +1450,7 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.peek_request()
                 request_id = request.request_id
                 if at_request_cap and self._sawtooth_is_decode(request, 1):
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                    skip_request(request_queue)
                     continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
@@ -1743,7 +1741,10 @@ class Scheduler(SchedulerInterface):
                         request, num_computed_tokens, num_new_tokens
                     )
                     num_new_tokens = self._sawtooth_split_tail_tokens(
-                        request, num_computed_tokens, num_new_tokens, num_scheduled_tokens
+                        request,
+                        num_computed_tokens,
+                        num_new_tokens,
+                        num_scheduled_tokens,
                     )
 
                     if num_new_tokens == 0:
@@ -2239,7 +2240,6 @@ class Scheduler(SchedulerInterface):
 
         Discards the last sampled output token from the prior input chunk.
         """
-
         if self.sawtooth_enabled:
             # Resumable input stays terminal-gated. A new worker request-state
             # allocation must receive a new generation, even for the same ID.

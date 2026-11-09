@@ -46,7 +46,7 @@ class LazyFuture(Future):
 class Scheduler:
     def __init__(self, count):
         self.waiting = deque(f"request-{index}" for index in range(count))
-        self.skipped_waiting = []
+        self.kv_holding_waiting = []
         self.running = []
         self.requests = {}
         self.schedule_calls = 0
@@ -1049,7 +1049,9 @@ def test_dependent_decode_policy_tracks_prefill_candidates(overlap):
     engine = SawtoothEngine(initial.core)
     # A policy hint alone must not fabricate a batch or block engine progress.
     for available in (True, False, True):
-        scheduler.sawtooth_has_prefill_candidate = lambda **kwargs: available
+        scheduler.sawtooth_has_prefill_candidate = (
+            lambda available=available, **kwargs: available
+        )
         assert engine.step() == ({}, False)
         assert scheduler.sawtooth_defer_dependent_decode == (overlap and available)
     assert not executor.commands

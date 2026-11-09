@@ -557,12 +557,12 @@ def test_blocked_waiters_do_not_inflate_available_work(admission_scheduler):
     }
 
 
-def test_ready_skipped_waiters_count_toward_cohort_size(admission_scheduler):
+def test_ready_kv_holding_waiters_count_toward_cohort_size(admission_scheduler):
     sched = admission_scheduler(max_num_seqs=8)
     for request in create_requests(8, num_tokens=8):
         sched.add_request(request)
     for _ in range(4):
-        sched.skipped_waiting.add_request(sched.waiting.pop_request())
+        sched.kv_holding_waiting.add_request(sched.waiting.pop_request())
     outputs = _admit_wave(sched, 4)
     assert [len(output.num_scheduled_tokens) for output in outputs] == [2] * 4
 
@@ -580,7 +580,7 @@ def test_lora_skip_does_not_consume_successful_admission_capacity(
     sched.sawtooth_available_batches = 3
     output = sched.schedule()
     assert set(output.num_scheduled_tokens) == {"0", "2"}
-    assert requests[1] in sched.skipped_waiting
+    assert requests[1] in sched.deferred_waiting
 
 
 def test_small_cohorts_do_not_preempt_another_live_batch(admission_scheduler):
@@ -612,7 +612,9 @@ def test_feature_off_preserves_original_admission(admission_scheduler):
     assert len(sched.schedule().num_scheduled_tokens) == 8
 
 @pytest.mark.parametrize('defer_decode', [False, True])
-def test_pending_decode_does_not_block_ready_prompt_chunk(admission_scheduler, defer_decode):
+def test_pending_decode_does_not_block_ready_prompt_chunk(
+    admission_scheduler, defer_decode
+):
     sched = admission_scheduler(max_num_seqs=4, max_model_len=32768)
     sched.sawtooth_request_ledger.allow_prefill_overlap = True
     sched.sawtooth_allow_early_admission = True
@@ -649,7 +651,9 @@ def test_ready_decode_is_not_filtered_by_prefill_policy(admission_scheduler):
 
 
 @pytest.mark.parametrize("blocked", [False, True])
-def test_prefill_opportunity_excludes_known_blocked_waiters(admission_scheduler, blocked):
+def test_prefill_opportunity_excludes_known_blocked_waiters(
+    admission_scheduler, blocked
+):
     sched = admission_scheduler(max_num_seqs=4)
     (request,) = create_requests(1, num_tokens=32)
     sched.add_request(request)
@@ -658,7 +662,9 @@ def test_prefill_opportunity_excludes_known_blocked_waiters(admission_scheduler,
     assert sched.sawtooth_has_prefill_candidate(require_eligible=True) == (not blocked)
 
 
-def test_prefill_opportunity_excludes_waiter_without_running_capacity(admission_scheduler):
+def test_prefill_opportunity_excludes_waiter_without_running_capacity(
+    admission_scheduler,
+):
     sched = admission_scheduler(max_num_seqs=1)
     (running,) = create_requests(1, num_tokens=32, max_tokens=16)
     sched.add_request(running)
@@ -1317,23 +1323,25 @@ def test_pair_balance_matches_waiting_queue_order(
     admission_scheduler, tmp_path, policy
 ):
     from vllm.v1.core.sched.request_queue import (
-        SchedulingPolicy, create_request_queue,
+        SchedulingPolicy,
+        create_request_queue,
     )
 
     engine, sched, executor, request = _balanced_engine(
         admission_scheduler, tmp_path, 32768
     )
     sched.max_num_running_reqs = 1
+    sched.max_num_active_reqs = 1
     sched.policy = SchedulingPolicy(policy)
     sched.waiting = create_request_queue(sched.policy)
-    sched.skipped_waiting = create_request_queue(sched.policy)
+    sched.kv_holding_waiting = create_request_queue(sched.policy)
     request.priority = 1
     sched.waiting.add_request(request)
     (other,) = create_requests(1, num_tokens=10240, max_tokens=1, req_ids=["B"])
     other.priority = 0
     sched.add_request(other)
     sched.waiting.remove_request(other)
-    sched.skipped_waiting.add_request(other)
+    sched.kv_holding_waiting.add_request(other)
     _drain_tail_engine(engine, sched)
     heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
     assert [o.num_scheduled_tokens for o in heads] == [

@@ -218,6 +218,7 @@ def test_real_native_unsampled_receive_does_not_accumulate_empty_pending():
             num_computed_tokens_np=np.array([index]),
             num_scheduled_tokens=np.array([1]),
             prefill_len_np=np.array([64]),
+            max_seq_len_np=None,
         )
         assert handler.receive(batch) is False
         handler.complete_sample()
