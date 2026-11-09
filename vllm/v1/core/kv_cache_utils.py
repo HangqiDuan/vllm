@@ -2677,8 +2677,10 @@ def get_kv_cache_configs(
 
     # Plan admission and allocation against the same four-block-aligned pool.
     available_memory = [
-        may_override_num_blocks(vllm_config, avail_mem // _pool_bytes_per_block(groups))
-        * _pool_bytes_per_block(groups)
+        may_override_num_blocks(
+            vllm_config, avail_mem // _pool_bytes_per_block(vllm_config, groups)
+        )
+        * _pool_bytes_per_block(vllm_config, groups)
         if groups
         else avail_mem
         for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
