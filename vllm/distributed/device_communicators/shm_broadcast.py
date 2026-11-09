@@ -958,6 +958,27 @@ class MessageQueue:
         if self.n_remote_reader > 0:
             self.remote_socket.send_multipart(all_buffers, copy=False)
 
+    def is_ready(self) -> bool:
+        """Probe one complete message without consuming it (single reader).
+
+        A published overflow marker can precede the socket payload. Keep its
+        read flag unset until that entire multipart message is also available.
+        """
+        if self.shutting_down:
+            raise RuntimeError("cancelled")
+        if self._is_local_reader:
+            with self.buffer.get_metadata(self.current_idx) as metadata:
+                memory_fence()
+                if not metadata[0] or metadata[self.local_reader_rank + 1]:
+                    return False
+                memory_fence()
+                with self.buffer.get_data(self.current_idx) as buf:
+                    overflow = buf[0] == 1
+            return not overflow or bool(self.local_socket.poll(timeout=0))
+        if self._is_remote_reader:
+            return bool(self.remote_socket.poll(timeout=0))
+        raise RuntimeError("Only readers can probe readiness")
+
     def dequeue(
         self,
         timeout: float | None = None,

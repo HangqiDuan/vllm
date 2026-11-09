@@ -91,12 +91,55 @@ class FutureWrapper(Future):
         futures_queue: deque["FutureWrapper"],
         get_response: Callable[[], Any],
         aggregate: Callable = lambda x: x,
+        *,
+        poll_response: Callable[[], tuple[bool, Any]] | None = None,
+        poll_check: Callable[[], None] | None = None,
     ):
         self.futures_queue = futures_queue
         self.get_response = get_response
         self.aggregate = aggregate
+        self.poll_response = poll_response
+        self.poll_check = poll_check
         super().__init__()
         self.futures_queue.appendleft(self)
+
+    @property
+    def can_poll(self) -> bool:
+        return self.poll_response is not None
+
+    def poll(self) -> bool:
+        """Drain ready responses in FIFO order, stopping at this future.
+
+        A callback may retain already-read ranks while waiting for the rest of
+        that RPC. No later RPC can pass it. Native lazy futures stay blocking.
+        """
+        if not self.can_poll:
+            return self.done()
+        while not self.done():
+            if self.poll_check is not None:
+                # Check our deadline even if an older no-deadline RPC is stuck.
+                self.poll_check()
+            future = self.futures_queue[-1]
+            if not future.can_poll:
+                return False
+            try:
+                ready, response = future.poll_response()
+            except Exception as error:
+                self.futures_queue.pop()
+                with suppress(InvalidStateError):
+                    future.set_exception(error)
+                continue
+            if not ready:
+                return False
+            self.futures_queue.pop()
+            try:
+                response = future.aggregate(response)
+                with suppress(InvalidStateError):
+                    future.set_result(response)
+            except Exception as error:
+                with suppress(InvalidStateError):
+                    future.set_exception(error)
+        return True
 
     def result(self, timeout=None):
         if timeout is not None:
@@ -457,9 +500,32 @@ class MultiprocExecutor(Executor):
         if output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
 
-        def read_response():
-            responses = []
-            for rank, mq in enumerate(response_mqs):
+        responses = []
+
+        def poison(error):
+            if getattr(self, "_sawtooth_enabled", False):
+                self._sawtooth_failure = error
+                self.is_failed = True
+
+        def check_poll():
+            try:
+                if failure := getattr(self, "_sawtooth_failure", None):
+                    raise failure
+                if self.is_failed or getattr(self, "shutting_down", False):
+                    raise RuntimeError("Executor failed or is shutting down.")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f"RPC call to {method} timed out.")
+            except Exception as error:
+                poison(error)
+                raise
+
+        def read_response(non_blocking=False):
+            # Partial all-rank replies belong to this RPC until it completes.
+            # This also surfaces rank0 failures without waiting for rank1.
+            for rank in range(len(responses), len(response_mqs)):
+                mq = response_mqs[rank]
+                if non_blocking and not mq.is_ready():
+                    return False, None
                 dequeue_timeout = (
                     None if deadline is None else max(0.0, deadline - time.monotonic())
                 )
@@ -477,19 +543,19 @@ class MultiprocExecutor(Executor):
                         " stack trace above for the root cause"
                     )
                 responses.append(result)
-            return responses[0] if output_rank is not None else responses
+            return True, responses[0] if output_rank is not None else responses
 
-        def get_response():
-            # A prior RPC may have failed before consuming every response MQ.
-            # FutureWrapper continues draining older futures after exceptions;
-            # never reinterpret the unread tail as a later RPC's responses.
-            # This guard also covers already queued metadata/control RPCs.
+        def get_response(non_blocking=False):
             if failure := getattr(self, "_sawtooth_failure", None):
                 raise failure
-            if not sawtooth_all_rank:
-                return read_response()
             try:
-                responses = read_response()
+                if non_blocking:
+                    check_poll()
+                ready, values = read_response(non_blocking)
+                if not ready:
+                    return False, None
+                if not sawtooth_all_rank:
+                    return True, values
                 command = (
                     getattr(args[0], "sawtooth_execution", None)
                     if method == "execute_model" and args
@@ -515,17 +581,20 @@ class MultiprocExecutor(Executor):
                 reply_rank = (
                     self.output_rank if unique_reply_rank is None else unique_reply_rank
                 )
-                return responses[reply_rank]
+                return True, responses[reply_rank]
             except Exception as error:
-                # Do not drain remaining MQs: a peer can be blocked in a
-                # collective after another rank failed. Poison this executor;
-                # the terminal future raises into EngineCore's fatal shutdown.
-                self._sawtooth_failure = error
-                self.is_failed = True
+                # A partial control/utility RPC can fail too. Never consume its
+                # unread rank responses as the next command after any failure.
+                poison(error)
                 raise
 
+        polling = getattr(self, "_sawtooth_enabled", False)
         future = FutureWrapper(
-            self.futures_queue, get_response=get_response, aggregate=aggregate
+            self.futures_queue,
+            get_response=lambda: get_response()[1],
+            aggregate=aggregate,
+            poll_response=(lambda: get_response(True)) if polling else None,
+            poll_check=check_poll if polling else None,
         )
 
         return future if non_block else future.result()
