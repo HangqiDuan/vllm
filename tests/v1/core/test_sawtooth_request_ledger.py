@@ -100,3 +100,64 @@ def test_final_prefill_admission_credit_requires_a_live_submitted_head():
     ledger.mark_tail_enqueued(step)
     ledger.settle(step, 0)
     assert not ledger.has_enqueued_final_prefill("a", 1024)
+
+
+def test_prefill_window_keeps_old_tail_and_new_pair_live():
+    ledger = SawtoothRequestLedger()
+    ledger.allow_prefill_overlap = True
+    ledger.max_live_prefill_steps = 3
+    old = ledger.admit("r", 0, 16384, False)
+    ledger.mark_head_enqueued(old)
+    ledger.mark_tail_enqueued(old)
+    first = ledger.admit("r", 16384, 1245, False)
+    ledger.mark_head_enqueued(first)
+    assert ledger.can_overlap_prefill("r")
+    second = ledger.admit("r", 17629, 1245, True)
+    ledger.mark_head_enqueued(second)
+    assert not ledger.can_advance("r")
+    with pytest.raises(RuntimeError, match="token lease"):
+        ledger.admit("r", 18874, 1, True)
+    with pytest.raises(RuntimeError, match="live"):
+        ledger.forget("r")
+    with pytest.raises(RuntimeError, match="Non-contiguous"):
+        ledger.settle(first, 1245)
+    ledger.settle(old, 2490)
+    ledger.mark_tail_enqueued(first)
+    ledger.settle(first, 1245)
+    assert not ledger.can_advance("r")
+    ledger.mark_tail_enqueued(second)
+    ledger.settle(second, 0)
+    ledger.forget("r")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prefill_window_requires_old_tails_before_third_head(enabled):
+    ledger = SawtoothRequestLedger()
+    ledger.allow_prefill_overlap = enabled
+    ledger.max_live_prefill_steps = 3
+    first = ledger.admit("r", 0, 16, False)
+    ledger.mark_head_enqueued(first)
+    if not enabled:
+        ledger.mark_tail_enqueued(first)
+    second = ledger.admit("r", 16, 16, False)
+    ledger.mark_head_enqueued(second)
+    assert not ledger.can_advance("r")
+    if enabled:
+        ledger.mark_tail_enqueued(first)
+        assert ledger.can_overlap_prefill("r")
+    else:
+        ledger.mark_tail_enqueued(second)
+        assert not ledger.can_advance("r")
+
+
+def test_prefill_window_cannot_cross_unretired_sampled_step():
+    ledger = SawtoothRequestLedger()
+    ledger.allow_prefill_overlap = True
+    ledger.max_live_prefill_steps = 3
+    sampled = ledger.admit("r", 0, 16, True)
+    ledger.mark_head_enqueued(sampled)
+    ledger.mark_tail_enqueued(sampled)
+    second = ledger.admit("r", 16, 1, False)
+    ledger.mark_head_enqueued(second)
+    assert not ledger.can_overlap_prefill("r")
+    assert not ledger.can_advance("r")

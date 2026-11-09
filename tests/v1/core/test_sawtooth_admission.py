@@ -113,10 +113,12 @@ def _tail_engine(admission_scheduler, length, *, capacity=3, max_tokens=1, **kwa
 
 
 def _drain_tail_engine(engine, sched):
+    peak_live = 0
     for _ in range(100):
         if not engine and not sched.has_requests():
-            return
+            return peak_live
         engine.step()
+        peak_live = max(peak_live, len(engine.active))
     pytest.fail("Tail pipeline failed to drain")
 
 
@@ -776,7 +778,7 @@ def test_short_tail_fills_remaining_budget_before_final_tail_split(
 
 
 @pytest.mark.parametrize("capacity", [2, 3])
-@pytest.mark.parametrize("arrival_step", [0, 1, 2, 3, 4, 5])
+@pytest.mark.parametrize("arrival_step", [0, 1, 2, 3, 4])
 def test_two_50k_prefills_pack_boundary_before_splitting_unpaired_tail(
     admission_scheduler, tmp_path, capacity, arrival_step
 ):
@@ -806,9 +808,9 @@ def test_two_50k_prefills_pack_boundary_before_splitting_unpaired_tail(
     _drain_tail_engine(engine, sched)
     heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
     batches = [o.num_scheduled_tokens for o in heads]
-    # Early admission can give the final full chunk a live cohort partner.
-    paired_tail = capacity == 3 and arrival_step < 3
-    expected = [20480] * 5 if paired_tail else [20480] * 4 + [10240, 10240]
+    # Live capacity must not turn three heads into a pair. After two full
+    # pairs, split only the final unpaired batch, including at capacity three.
+    expected = [20480] * 4 + [10240, 10240]
     assert [sum(b.values()) for b in batches] == expected, batches
     assert {request.request_id: 10240, partner.request_id: 10240} in batches
     for req in (request, partner):
@@ -879,7 +881,8 @@ def test_prefill_boundary_reuses_only_a_finishing_requests_kv(
         max_model_len=131072, num_blocks=4000,
     )
     sched.scheduler_reserve_full_isl = True
-    for _ in range(5):
+    # Arrive after the first pair tails, before the next head.
+    while len(executor.commands) < 4:
         engine.step()
     (partner,) = create_requests(
         1, num_tokens=51200, max_tokens=max_tokens, req_ids=["partner"]
@@ -1011,7 +1014,7 @@ def test_tail_parity_resets_between_drained_request_groups(
     assert request.num_output_tokens == 1
 
 
-@pytest.mark.parametrize("arrival_step", [0, 1, 2, 3, 4, 5])
+@pytest.mark.parametrize("arrival_step", [0, 1, 2, 3, 4])
 def test_two_three_chunk_prompts_keep_six_full_batches(
     admission_scheduler, arrival_step
 ):
@@ -1030,10 +1033,16 @@ def test_two_three_chunk_prompts_keep_six_full_batches(
 
 @pytest.mark.parametrize(
     "length,counts",
-    [(61440, [10240] * 6), (65536, [10240] * 6 + [2048, 2048])],
+    [
+        (51200, [10240] * 4 + [5120, 5120]),
+        (56320, [10240] * 5 + [5120]),
+        (61440, [10240] * 6),
+        (65536, [10240] * 6 + [2048, 2048]),
+    ],
 )
-def test_mbt10k_keeps_six_chunks_and_splits_seventh_tail(
-    admission_scheduler, tmp_path, length, counts
+@pytest.mark.parametrize("request_count", [1, 2])
+def test_mbt10k_pairs_heads_and_splits_only_unpaired_tail(
+    admission_scheduler, tmp_path, length, counts, request_count
 ):
     config_path = tmp_path / "config.json"
     config = json.loads(config_path.read_text())
@@ -1045,10 +1054,397 @@ def test_mbt10k_keeps_six_chunks_and_splits_seventh_tail(
         return admission_scheduler(**kwargs)
 
     engine, sched, executor, request = _tail_engine(
-        configured, length, max_model_len=131072, num_blocks=10000
+        configured, length // request_count, capacity=3,
+        max_model_len=131072, num_blocks=10000
     )
-    _drain_tail_engine(engine, sched)
+    if request_count == 2:
+        (partner,) = create_requests(
+            1, num_tokens=length // 2, max_tokens=1, req_ids=["B"]
+        )
+        sched.add_request(partner)
+    peak_live = _drain_tail_engine(engine, sched)
+    assert engine.capacity == 3
+    if request_count == 2:
+        assert peak_live == 3
+        assert partner.num_output_tokens == 1
+        assert partner.num_in_flight_tokens == 0
     heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
     assert [o.total_num_scheduled_tokens for o in heads] == counts
     assert sum(counts) == length
     assert request.num_output_tokens == 1
+    # With three live slots, preserve pairs of heads before their tails.
+    # Exact token counts alone cannot prove the final two heads are paired.
+    commands = [
+        (o.sawtooth_execution.batch_id, o.sawtooth_execution.round_id)
+        for o in executor.commands
+    ]
+    expected = [
+        (batch, round_id)
+        for first in range(0, len(counts), 2)
+        for round_id in range(2)
+        for batch in (first, first + 1)
+    ]
+    assert commands == expected
+
+
+
+def _balanced_engine(admission_scheduler, tmp_path, length, *, mbt=16384,
+                     capacity=3, **kwargs):
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["max_position_embeddings"] = 262144
+    config_path.write_text(json.dumps(config))
+
+    def configured(**options):
+        options["max_num_batched_tokens"] = mbt
+        return admission_scheduler(**options)
+
+    engine, sched, executor, request = _tail_engine(
+        configured, length, capacity=capacity, max_model_len=262144,
+        num_blocks=kwargs.pop("num_blocks", 20000), **kwargs
+    )
+    sched.sawtooth_balance_prefill_pairs = True
+    return engine, sched, executor, request
+
+
+@pytest.mark.parametrize("capacity", [2, 3])
+@pytest.mark.parametrize("length,expected", [
+    (16467, [8234, 8233]),
+    (18432, [9216, 9216]),
+    (10240, [5120, 5120]),
+    (32768, [16384, 16384]),
+    (49152, [16384, 16384, 8192, 8192]),
+    (51200, [16384, 16384, 9216, 9216]),
+    (56320, [16384, 16384, 11776, 11776]),
+    (61440, [16384, 16384, 14336, 14336]),
+    (65536, [16384] * 4),
+    (1, [1]),
+])
+def test_pair_balance_real_scheduler_single_request(
+    admission_scheduler, tmp_path, capacity, length, expected
+):
+    engine, sched, executor, request = _balanced_engine(
+        admission_scheduler, tmp_path, length, capacity=capacity
+    )
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert [o.total_num_scheduled_tokens for o in heads] == expected
+    end = 0
+    for output in heads:
+        step = output.sawtooth_request_steps[request.request_id]
+        assert step.token_start == end
+        end = step.token_end
+        assert step.produces_sample == (end == length)
+    assert end == length
+    assert request.num_output_tokens == 1
+    assert request.num_in_flight_tokens == 0
+    order = [(o.sawtooth_execution.batch_id, o.sawtooth_execution.round_id)
+             for o in executor.commands]
+    for a, other in zip(heads[::2], heads[1::2]):
+        aid = a.sawtooth_execution.batch_id
+        bid = other.sawtooth_execution.batch_id
+        assert order.index((aid, 0)) < order.index((bid, 0))
+        assert order.index((bid, 0)) < order.index((aid, 1))
+        assert order.index((aid, 1)) < order.index((bid, 1))
+
+
+def test_pair_balance_waiting_small_partner_is_included(
+    admission_scheduler, tmp_path
+):
+    engine, sched, executor, request = _balanced_engine(
+        admission_scheduler, tmp_path, 16384
+    )
+    (other,) = create_requests(1, num_tokens=2048, max_tokens=1, req_ids=["B"])
+    sched.add_request(other)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert [o.num_scheduled_tokens for o in heads] == [
+        {request.request_id: 9216}, {request.request_id: 7168, "B": 2048}
+    ]
+    assert request.num_output_tokens == other.num_output_tokens == 1
+
+
+def test_pair_balance_late_arrival_keeps_reserved_second_budget(
+    admission_scheduler, tmp_path
+):
+    engine, sched, executor, request = _balanced_engine(
+        admission_scheduler, tmp_path, 16467
+    )
+    engine.step()
+    (other,) = create_requests(1, num_tokens=32768, max_tokens=1, req_ids=["B"])
+    sched.add_request(other)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert [o.total_num_scheduled_tokens for o in heads] == [8234, 8233, 16384, 16384]
+    assert heads[1].num_scheduled_tokens == {request.request_id: 8233}
+    assert request.num_output_tokens == other.num_output_tokens == 1
+
+
+
+@pytest.mark.parametrize("mbt,length,expected", [
+    (10240, 51200, [10240] * 4 + [5120, 5120]),
+    (10240, 56320, [10240] * 4 + [7680, 7680]),
+    (10240, 61440, [10240] * 6),
+    (10240, 65536, [10240] * 6 + [2048, 2048]),
+])
+def test_pair_balance_preserves_full_pairs_mbt10k(
+    admission_scheduler, tmp_path, mbt, length, expected
+):
+    engine, sched, executor, _ = _balanced_engine(
+        admission_scheduler, tmp_path, length, mbt=mbt
+    )
+    _drain_tail_engine(engine, sched)
+    assert [o.total_num_scheduled_tokens for o in executor.commands
+            if o.sawtooth_execution.is_first_round] == expected
+
+
+def test_pair_balance_uses_actual_prefix_hit_remaining_tokens(
+    admission_scheduler, tmp_path
+):
+    engine, sched, executor, _ = _balanced_engine(
+        admission_scheduler, tmp_path, 114689, enable_prefix_caching=True
+    )
+    _drain_tail_engine(engine, sched)
+    executor.commands.clear()
+    (request,) = create_requests(1, num_tokens=131155, max_tokens=1, req_ids=["hit"])
+    assert sched.kv_cache_manager.get_computed_blocks(request)[1] == 114688
+    sched.add_request(request)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert [o.total_num_scheduled_tokens for o in heads] == [8234, 8233]
+    a, b = [o.sawtooth_request_steps["hit"] for o in heads]
+    assert (a.token_start, a.token_end, b.token_start, b.token_end) == (
+        114688, 122922, 122922, 131155
+    )
+
+
+def test_pair_balance_does_not_count_kv_blocked_waiter(
+    admission_scheduler, tmp_path
+):
+    engine, sched, executor, request = _balanced_engine(
+        admission_scheduler, tmp_path, 16467, num_blocks=2200
+    )
+    sched.scheduler_reserve_full_isl = True
+    (other,) = create_requests(1, num_tokens=32768, max_tokens=1, req_ids=["B"])
+    sched.add_request(other)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert [o.total_num_scheduled_tokens for o in heads[:2]] == [8234, 8233]
+    assert request.num_output_tokens == other.num_output_tokens == 1
+    assert request.num_preemptions == other.num_preemptions == 0
+    assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == 2199
+
+
+def test_pair_balance_failed_allocation_can_retry_without_consuming_plan(
+    admission_scheduler, tmp_path, monkeypatch
+):
+    engine, sched, executor, request = _balanced_engine(
+        admission_scheduler, tmp_path, 16467
+    )
+    allocate = sched.kv_cache_manager.allocate_slots
+    monkeypatch.setattr(sched.kv_cache_manager, "allocate_slots", lambda *a, **k: None)
+    engine.step()
+    assert not executor.commands
+    assert sched._sawtooth_prefill_batches == 0
+    assert sched._sawtooth_pair_next_budget is None
+    monkeypatch.setattr(sched.kv_cache_manager, "allocate_slots", allocate)
+    _drain_tail_engine(engine, sched)
+    assert [o.total_num_scheduled_tokens for o in executor.commands
+            if o.sawtooth_execution.is_first_round] == [8234, 8233]
+    assert request.num_output_tokens == 1
+
+
+@pytest.mark.parametrize("admit_second", [False, True])
+def test_pair_balance_abort_keeps_inflight_kv_and_resets_next_wave(
+    admission_scheduler, tmp_path, admit_second
+):
+    engine, sched, executor, request = _balanced_engine(
+        admission_scheduler, tmp_path, 16467
+    )
+    engine.step()
+    if admit_second:
+        engine.step()
+    blocks = [
+        b
+        for group in sched.kv_cache_manager.get_blocks(request.request_id).blocks
+        for b in group
+    ]
+    sched.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    assert all(b.ref_cnt > 0 for b in blocks)
+    _drain_tail_engine(engine, sched)
+    assert request.num_output_tokens == 0
+    assert all(b.ref_cnt == 0 for b in blocks)
+    executor.commands.clear()
+    (other,) = create_requests(1, num_tokens=18432, max_tokens=1, req_ids=["B"])
+    sched.add_request(other)
+    _drain_tail_engine(engine, sched)
+    assert [o.total_num_scheduled_tokens for o in executor.commands
+            if o.sawtooth_execution.is_first_round] == [9216, 9216]
+
+
+def test_pair_balance_does_not_change_decode_steps(admission_scheduler, tmp_path):
+    engine, sched, executor, request = _balanced_engine(
+        admission_scheduler, tmp_path, 16467, max_tokens=3
+    )
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert [o.total_num_scheduled_tokens for o in heads] == [8234, 8233, 1, 1]
+    assert [o.sawtooth_has_decode for o in heads] == [False, False, True, True]
+    assert request.num_output_tokens == 3
+
+
+def test_pair_balance_configuration_reaches_engine(admission_scheduler, tmp_path):
+    from vllm.distributed.sawtooth import SawtoothConfig
+    from vllm.v1.engine.sawtooth import SawtoothEngine
+
+    engine, sched, _, _ = _balanced_engine(admission_scheduler, tmp_path, 16467)
+    options = engine.core.vllm_config.additional_config["sawtooth_pipeline"]
+    config = SawtoothConfig.from_vllm_config(engine.core.vllm_config)
+    assert not config.enable_prefill_pair_balance
+    options["enable_prefill_pair_balance"] = True
+    config = SawtoothConfig.from_vllm_config(engine.core.vllm_config)
+    assert config.enable_prefill_pair_balance
+    sched.sawtooth_balance_prefill_pairs = False
+    SawtoothEngine(engine.core)
+    assert sched.sawtooth_balance_prefill_pairs
+    options["enable_prefill_pair_balance"] = "true"
+    with pytest.raises(ValueError, match="must be a boolean"):
+        SawtoothConfig.from_vllm_config(engine.core.vllm_config)
+
+
+@pytest.mark.parametrize("policy", ["fcfs", "priority"])
+def test_pair_balance_matches_waiting_queue_order(
+    admission_scheduler, tmp_path, policy
+):
+    from vllm.v1.core.sched.request_queue import (
+        SchedulingPolicy, create_request_queue,
+    )
+
+    engine, sched, executor, request = _balanced_engine(
+        admission_scheduler, tmp_path, 32768
+    )
+    sched.max_num_running_reqs = 1
+    sched.policy = SchedulingPolicy(policy)
+    sched.waiting = create_request_queue(sched.policy)
+    sched.skipped_waiting = create_request_queue(sched.policy)
+    request.priority = 1
+    sched.waiting.add_request(request)
+    (other,) = create_requests(1, num_tokens=10240, max_tokens=1, req_ids=["B"])
+    other.priority = 0
+    sched.add_request(other)
+    sched.waiting.remove_request(other)
+    sched.skipped_waiting.add_request(other)
+    _drain_tail_engine(engine, sched)
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert [o.num_scheduled_tokens for o in heads] == [
+        {"B": 5120}, {"B": 5120},
+        {request.request_id: 16384}, {request.request_id: 16384},
+    ]
+
+
+def test_pair_balance_lookahead_does_not_emit_cache_events(
+    admission_scheduler, tmp_path, monkeypatch
+):
+    engine, sched, _, _ = _balanced_engine(
+        admission_scheduler, tmp_path, 1025, enable_prefix_caching=True
+    )
+    _drain_tail_engine(engine, sched)
+    (request,) = create_requests(1, num_tokens=17491, max_tokens=1, req_ids=["hit"])
+    request.kv_cache_report_mode = "full"
+    sched.add_request(request)
+    manager = sched.kv_cache_manager
+    manager.enable_kv_cache_events = True
+    events = []
+    monkeypatch.setattr(manager.coordinator, "emit_cached_block_events",
+                        lambda *args: events.append(args))
+    sched.sawtooth_split_prefill_tail = True
+    assert sched._sawtooth_pair_budget(16384) == 8234
+    assert events == []
+    # The real lookup still emits its event.
+    assert manager.get_computed_blocks(request)[1] == 1024
+    assert len(events) == 1
+
+
+def test_pair_balance_trims_retained_hits_for_kv_estimate(
+    admission_scheduler, tmp_path, monkeypatch
+):
+    engine, sched, _, request = _balanced_engine(
+        admission_scheduler, tmp_path, 16483, enable_prefix_caching=True
+    )
+    manager = sched.kv_cache_manager
+    sched.sawtooth_request_ledger.allow_prefill_overlap = True
+    manager.retained_hit_group_ids = {0}
+    blocks = [manager.block_pool.null_block] * 4
+    monkeypatch.setattr(manager.coordinator, "find_longest_cache_hit",
+                        lambda *args: ((blocks,), 16, 48))
+    estimate = manager.coordinator.get_num_blocks_to_allocate
+    seen = []
+
+    def check(**kwargs):
+        seen.append(len(kwargs["new_computed_blocks"][0]))
+        return estimate(**kwargs)
+
+    monkeypatch.setattr(manager.coordinator, "get_num_blocks_to_allocate", check)
+    sched.sawtooth_split_prefill_tail = True
+    assert sched._sawtooth_pair_budget(16384) == 8234
+    assert seen == [1]
+    assert len(blocks) == 4  # Never mutate the cached lookup result.
+
+
+@pytest.mark.parametrize("length", [49152, 65536, 65536 + 2490])
+def test_pair_overlap_submits_second_head_before_previous_tail_retirement(
+    admission_scheduler, tmp_path, length
+):
+    engine, sched, executor, request = _balanced_engine(
+        admission_scheduler, tmp_path, length, capacity=3
+    )
+    admissions = []
+    original = executor.execute_model
+
+    def execute(output, non_block):
+        command = output.sawtooth_execution
+        if command is not None and command.is_first_round:
+            state = sched.sawtooth_request_ledger.requests[request.request_id]
+            admissions.append((command.batch_id, state.completed_end,
+                               len(state.live)))
+        return original(output, non_block)
+
+    executor.execute_model = execute
+    _drain_tail_engine(engine, sched)
+    # Heads 2 and 3 must share the remaining slots with unretired tail 1.
+    assert admissions[3] == (3, 16384, 3)
+    assert request.num_in_flight_tokens == 0
+    assert request.num_output_tokens == 1
+
+
+def test_pair_overlap_late_request_keeps_already_submitted_tail_immutable(
+    admission_scheduler, tmp_path
+):
+    engine, sched, executor, request = _balanced_engine(
+        admission_scheduler, tmp_path, 49152, capacity=3
+    )
+    for _ in range(5):
+        engine.step()
+    submitted = deepcopy(executor.commands)
+    heads = [o for o in submitted if o.sawtooth_execution.is_first_round]
+    assert [o.total_num_scheduled_tokens for o in heads] == [16384, 16384, 8192]
+    (partner,) = create_requests(1, num_tokens=2048, max_tokens=1, req_ids=["late"])
+    sched.add_request(partner)
+    _drain_tail_engine(engine, sched)
+    for before, after in zip(submitted, executor.commands):
+        assert before.sawtooth_request_steps == after.sawtooth_request_steps
+        assert before.num_scheduled_tokens == after.num_scheduled_tokens
+    heads = [o for o in executor.commands if o.sawtooth_execution.is_first_round]
+    assert heads[3].total_num_scheduled_tokens == 8192
+    for req in (request, partner):
+        end = 0
+        for output in heads:
+            step = output.sawtooth_request_steps.get(req.request_id)
+            if step is not None:
+                assert step.token_start == end
+                end = step.token_end
+        assert end == req.num_prompt_tokens
+        assert req.num_output_tokens == 1
+        assert req.num_in_flight_tokens == 0
+        assert req.request_id not in sched.requests
+    assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == 19999

@@ -79,20 +79,14 @@ class SawtoothRequestLedger:
         self.requests: dict[str, _RequestSteps] = {}
         self.next_generation = 0
         self.allow_prefill_overlap = False
+        self.max_live_prefill_steps = 2
 
     def can_advance(self, request_id: str) -> bool:
         state = self.requests.get(request_id)
-        return bool(
+        return self.can_overlap_prefill(request_id) or bool(
             state is not None
             and len(state.live) == 1
-            and (
-                state.tail_enqueued == state.live[-1].step_id
-                or (
-                    self.allow_prefill_overlap
-                    and not state.live[-1].produces_sample
-                    and state.head_enqueued == state.live[-1].step_id
-                )
-            )
+            and state.tail_enqueued == state.live[-1].step_id
         )
 
     def can_overlap_prefill(self, request_id: str) -> bool:
@@ -100,9 +94,17 @@ class SawtoothRequestLedger:
         return bool(
             self.allow_prefill_overlap
             and state is not None
-            and len(state.live) == 1
-            and not state.live[-1].produces_sample
+            and 0 < len(state.live) < self.max_live_prefill_steps
+            and all(not step.produces_sample for step in state.live)
             and state.head_enqueued == state.live[-1].step_id
+            # Older pairs may still own KV while their terminal commands are
+            # already on every worker FIFO. Only the newest head can be ahead
+            # of its tail; this admits its partner without opening a third head
+            # before the older pair's tails. Submission never releases KV.
+            and (
+                len(state.live) == 1
+                or state.tail_enqueued >= state.live[-2].step_id
+            )
         )
 
     def has_enqueued_final_prefill(self, request_id: str, end: int) -> bool:
@@ -126,7 +128,10 @@ class SawtoothRequestLedger:
             state = _RequestSteps(self.next_generation, start, start)
             self.next_generation += 1
             self.requests[request_id] = state
-        if count <= 0 or state.scheduled_end != start or len(state.live) >= 2:
+        capacity = (
+            max(2, self.max_live_prefill_steps) if self.allow_prefill_overlap else 2
+        )
+        if count <= 0 or state.scheduled_end != start or len(state.live) >= capacity:
             raise RuntimeError("Invalid sawtooth request token lease")
         if state.live and not self.can_advance(request_id):
             raise RuntimeError("Sawtooth predecessor has unsent terminal commands")

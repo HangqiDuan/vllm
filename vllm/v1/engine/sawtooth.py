@@ -32,6 +32,9 @@ class SawtoothEngine:
             config, config.model_config.hf_text_config.num_hidden_layers
         )
         assert self.plan is not None
+        core.scheduler.sawtooth_balance_prefill_pairs = (
+            self.plan.config.enable_prefill_pair_balance
+        )
         if not config.use_v2_model_runner:
             raise ValueError("Sawtooth requires Model Runner V2")
         if core.is_pooling_model:
@@ -90,8 +93,56 @@ class SawtoothEngine:
             # round zero on the same FIFO. This is not a device completion.
             self.core.scheduler.sawtooth_mark_tail_enqueued(batch.scheduler_output)
 
+    def _prefill_pair_blocks_admission(self):
+        if not (
+            self.plan.config.enable_prefill_chunk_overlap
+            and self.plan.pipeline_size == 2
+            and self.plan.virtual_size == 2
+        ):
+            return False
+        # Slot capacity bounds live ownership, not the size of a prefill pair.
+        # Older frozen tails may still own the third slot while the next two
+        # heads form a pair. Never let a third head extend that new pair.
+        if self.phase_limit is not None and any(
+            batch.batch_id <= self.phase_limit
+            and not batch.scheduler_output.sawtooth_has_decode
+            for batch in self.rounds
+        ):
+            # Finish submitting both tails before admitting the next pair.
+            return True
+        pending = [
+            batch
+            for batch in self.rounds
+            if self.phase_limit is None or batch.batch_id > self.phase_limit
+        ]
+        return len(pending) >= 2 and all(
+            not batch.scheduler_output.sawtooth_has_decode for batch in pending
+        )
+
+    def _advance_submitted_prefill_pair(self):
+        # Host retirement owns KV publication and slot reuse. It need not gate
+        # submitting another complete prefill pair after all older tails are
+        # already on every worker's FIFO. Decode/mixed cohorts keep their drain.
+        if not (
+            self.plan.config.enable_prefill_chunk_overlap
+            and self.plan.pipeline_size == 2
+            and self.plan.virtual_size == 2
+            and self.phase_limit is not None
+            and len(self.rounds) == 2
+            and all(batch.batch_id > self.phase_limit for batch in self.rounds)
+            and all(
+                not batch.scheduler_output.sawtooth_has_decode
+                for batch in self.active
+            )
+            and not self.controls
+        ):
+            return
+        self.phase_limit = self.rounds[-1].batch_id
+
     def _can_admit(self):
         scheduler = self.core.scheduler
+        if self._prefill_pair_blocks_admission():
+            return False
         if not self.slots or not scheduler.has_requests():
             return False
         if scheduler.sawtooth_decode_only:
@@ -173,7 +224,9 @@ class SawtoothEngine:
 
     def step(self):
         if self.plan.config.enable_prefill_chunk_overlap:
-            self.core.scheduler.sawtooth_request_ledger.allow_prefill_overlap = True
+            ledger = self.core.scheduler.sawtooth_request_ledger
+            ledger.allow_prefill_overlap = True
+            ledger.max_live_prefill_steps = self.capacity
         # An early dependent head must not insert a sample wait ahead of older
         # ready continuations.
         self.core.scheduler.sawtooth_allow_early_admission = (
@@ -244,10 +297,11 @@ class SawtoothEngine:
             future = self.core.model_executor.execute_model(output, non_block=True)
             self.controls.append((output, future))
 
+        self._advance_submitted_prefill_pair()
         if self.phase_limit is None and self.rounds:
             # Freeze the cohort when its first continuation is submitted. A
-            # refill may submit round zero, but its tail must wait until every
-            # old terminal has retired and had an opportunity to refill.
+            # refill can submit round zero. Complete pure-prefill pairs may
+            # advance above; other cohorts keep the retirement/refill boundary.
             self.phase_limit = self.next_batch_id - 1
         eligible = None
         if self.phase_limit is not None:
@@ -274,6 +328,25 @@ class SawtoothEngine:
             return None, True
 
         if self.active:
+            terminal = self.active[0].terminal_future
+            if (
+                self.slots
+                and not self.controls
+                and self.plan.config.enable_prefill_chunk_overlap
+                and self.plan.pipeline_size == 2
+                and self.plan.virtual_size == 2
+                and all(
+                    not batch.scheduler_output.sawtooth_has_decode
+                    for batch in self.active
+                )
+                and terminal is not None
+                and getattr(terminal, "can_poll", False)
+                and not terminal.poll()
+            ):
+                # Leave KV and slots owned by the pending batch. Returning to
+                # EngineCore lets newly arrived requests fill the spare slot;
+                # response consumption remains single-reader FIFO.
+                return None, False
             # done() on a Multiproc FutureWrapper does not poll responses.
             # Explicitly drain only after all rounds of this cohort have been
             # submitted; otherwise a host wait can stall the physical pipe.

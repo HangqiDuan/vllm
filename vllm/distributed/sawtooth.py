@@ -23,6 +23,7 @@ class SawtoothConfig:
     enable_early_admission: bool = True
     enable_prefill_chunk_overlap: bool = False
     enable_sas_metadata_reuse: bool = False
+    enable_prefill_pair_balance: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -31,6 +32,8 @@ class SawtoothConfig:
             raise ValueError("enable_early_admission must be a boolean")
         if type(self.enable_prefill_chunk_overlap) is not bool:
             raise ValueError("enable_prefill_chunk_overlap must be a boolean")
+        if type(self.enable_prefill_pair_balance) is not bool:
+            raise ValueError("enable_prefill_pair_balance must be a boolean")
         if type(self.enable_sas_metadata_reuse) is not bool:
             raise ValueError("enable_sas_metadata_reuse must be a boolean")
         if type(self.virtual_size) is not int or self.virtual_size < 1:
@@ -62,6 +65,7 @@ class SawtoothConfig:
             "enable_early_admission",
             "enable_prefill_chunk_overlap",
             "enable_sas_metadata_reuse",
+            "enable_prefill_pair_balance",
         }
         if unknown:
             raise ValueError(f"Unknown sawtooth_pipeline options: {sorted(unknown)}")
@@ -89,6 +93,7 @@ class SawtoothConfig:
             raw.get("enable_early_admission", True),
             raw.get("enable_prefill_chunk_overlap", False),
             raw.get("enable_sas_metadata_reuse", False),
+            raw.get("enable_prefill_pair_balance", False),
         )
 
 
