@@ -47,6 +47,7 @@ class KeyedPPHandler:
         self.allow_prefill_overlap = False
         self.admitted_steps: dict[tuple[str, int, int], int] = {}
         self.group_steps: dict[tuple[str, int], SawtoothRequestStep] = {}
+        self.terminal_sample_steps: set[tuple[str, int, int]] = set()
 
     def __getattr__(self, name):
         return getattr(self.native, name)
@@ -167,7 +168,11 @@ class KeyedPPHandler:
                 self.retired_events[id(previous.event)] = previous.event
             # On the last rank postprocess_sampled already ran. On other ranks
             # only rows producing samples need deferred token writeback.
-            applied = self.native.is_last_rank or not step.produces_sample
+            applied = (
+                self.native.is_last_rank
+                or not step.produces_sample
+                or step.key in self.terminal_sample_steps
+            )
             if not applied and (
                 self.batch_id not in self.pending
                 or rid not in self.pending[self.batch_id][0]
@@ -175,6 +180,7 @@ class KeyedPPHandler:
                 raise RuntimeError("Sampled step has no pending token receive")
             self.producers[rid] = _ProducerReady(step, self.batch_id, event, applied)
             self.admitted_steps.pop(step.key, None)
+            self.terminal_sample_steps.discard(step.key)
         self.sample_steps = None
 
     def forget_requests(self, request_ids):
@@ -207,6 +213,19 @@ class KeyedPPHandler:
             pending = self.native.queue[-1]
         finally:
             self.native.queue = original_queue
+        # V0.32 skips token writeback for a final prefill whose first sample
+        # reaches the length cap. It still produces an API output, but has no
+        # subsequent decode dependency. Keep this exemption tied to the exact
+        # logical step, including in batches with other rows needing a receive.
+        max_seq_len = getattr(input_batch, "max_seq_len_np", None)
+        if max_seq_len is not None and self.sample_steps is not None:
+            finished = input_batch.prefill_len_np + 1 >= max_seq_len
+            finished &= input_batch.is_prefilling_np
+            self.terminal_sample_steps.update(
+                self.sample_steps[rid].key
+                for rid, terminal in zip(input_batch.req_ids, finished)
+                if terminal and self.sample_steps[rid].produces_sample
+            )
         if pending is not None:
             mask = getattr(pending, "need_sampled_mask", None)
             if mask is None and self.sample_steps is not None:
@@ -218,7 +237,11 @@ class KeyedPPHandler:
                 mask is not None
                 and self.sample_steps is not None
                 and any(
-                    bool(sampled) != self.sample_steps[rid].produces_sample
+                    bool(sampled)
+                    != (
+                        self.sample_steps[rid].produces_sample
+                        and self.sample_steps[rid].key not in self.terminal_sample_steps
+                    )
                     for rid, sampled in zip(input_batch.req_ids, mask)
                 )
             ):

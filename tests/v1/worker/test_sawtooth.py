@@ -281,3 +281,61 @@ def test_no_sample_row_can_advance_while_a_peer_row_still_needs_tokens(next_b_sa
     assert handler.producers["B"].step.step_id == 1
     assert handler.producers["B"].applied is (not next_b_sampled)
     assert 0 not in handler.pending
+
+
+@pytest.mark.parametrize("with_decode", [False, True])
+def test_terminal_prefill_needs_no_sample_writeback(with_decode):
+    import numpy as np
+
+    from vllm.v1.worker.gpu.pp_utils import PPHandler, compute_need_sampled_mask
+
+    handler, runner, _, updates = ready_fixture()
+    steps = {"A": request_step("A", 0)}
+    if with_decode:
+        steps["B"] = request_step("B", 0)
+    handler.begin_batch(0, steps, runner, steps)
+    handler.sample_steps = steps
+    batch = SimpleNamespace(
+        req_ids=list(steps),
+        num_computed_tokens_np=np.array([49152, 8] if with_decode else [49152]),
+        num_scheduled_tokens=np.array([16384, 1] if with_decode else [16384]),
+        prefill_len_np=np.array([65536, 8] if with_decode else [65536]),
+        max_seq_len_np=np.array([65537, 16] if with_decode else [65537]),
+        is_prefilling_np=np.array([True, False] if with_decode else [True]),
+    )
+    if with_decode:
+        # Use native eligibility; actual transport needs a device group.
+        receive = handler.native.receive
+
+        def masked_receive(input_batch):
+            result = receive(input_batch)
+            handler.native.queue[-1].need_sampled_mask = compute_need_sampled_mask(
+                input_batch
+            )
+            return result
+
+        handler.native.receive = masked_receive
+    else:
+        handler.native.receive = PPHandler.receive.__get__(handler.native)
+    handler.receive(batch)
+    handler.complete_sample()
+    assert handler.producers["A"].applied
+    if with_decode:
+        assert handler.pending[0][0] == ("B",)
+        assert not handler.producers["B"].applied
+        handler.forget_requests({"A"})
+        handler.begin_batch(1, ["B"], runner, {"B": request_step("B", 1)})
+        assert updates == [("B",)]
+    else:
+        assert not handler.pending and not updates
+        handler.forget_requests({"A"})
+    assert "A" not in handler.producers
+
+
+def test_nonterminal_sample_still_requires_token_receive():
+    handler, runner, _, _ = ready_fixture()
+    steps = {"A": request_step("A", 0)}
+    handler.begin_batch(0, steps, runner, steps)
+    handler.sample_steps = steps
+    with pytest.raises(RuntimeError, match="no pending token receive"):
+        handler.complete_sample()
