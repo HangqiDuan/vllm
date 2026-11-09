@@ -941,6 +941,8 @@ def resolve_cache_hit_alignment_tokens(
 def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
+    *,
+    max_cached_prompt_tokens: int = 0,
 ) -> Callable[[Request], list[BlockHash]]:
     """Returns a function which computes the list of un-computed block hashes
     of a request.
@@ -951,7 +953,14 @@ def get_request_block_hasher(
     these hashes directly (see ``BlockHashListWithBlockSize``).
     """
 
+    # Cache one bounded plain-text prefix, not KV ownership or cache hits.
+    # Private copies keep later Request mutations out of the snapshot. A local
+    # reference also keeps readers safe if another call replaces the snapshot.
+    cache_limit = max(0, max_cached_prompt_tokens) // hash_block_size * hash_block_size
+    cached_prompt = None
+
     def request_block_hasher(request: Request) -> list[BlockHash]:
+        nonlocal cached_prompt
         start_token_idx = len(request.block_hashes) * hash_block_size
         num_tokens = request.num_tokens
 
@@ -974,6 +983,37 @@ def get_request_block_hasher(
             request.block_hashes[-1] if request.block_hashes else None
         )
         new_block_hashes: list[BlockHash] = []
+        cacheable = (
+            cache_limit > 0
+            and start_token_idx == 0
+            and request.prompt_token_ids is not None
+            and not request.mm_features
+            and request.lora_request is None
+            and request.prompt_embeds is None
+            and request.prompt_is_token_ids is None
+        )
+        if cacheable:
+            key = (NONE_HASH, request.cache_salt)
+            snapshot = cached_prompt
+            if snapshot is not None and snapshot[0] == key:
+                _, old_tokens, old_hashes = snapshot
+                limit = min(len(old_tokens), num_tokens)
+                common = 0
+                # List equality compares long matching text prefixes in C;
+                # avoid a Python iteration for every two-token hash block.
+                while common + 4096 <= limit:
+                    end = common + 4096
+                    if old_tokens[common:end] != request.all_token_ids[common:end]:
+                        break
+                    common = end
+                while common < limit and old_tokens[common] == request.all_token_ids[common]:
+                    common += 1
+                blocks = common // hash_block_size
+                new_block_hashes = list(old_hashes[:blocks])
+                start_token_idx = blocks * hash_block_size
+                if blocks:
+                    prev_block_hash_value = new_block_hashes[-1]
+
         while True:
             end_token_idx = start_token_idx + hash_block_size
             if end_token_idx > num_tokens:
@@ -995,6 +1035,15 @@ def get_request_block_hasher(
             start_token_idx += hash_block_size
             prev_block_hash_value = block_hash
 
+        if cacheable:
+            length = min(request.num_prompt_tokens, cache_limit)
+            blocks = length // hash_block_size
+            if blocks:
+                cached_prompt = (
+                    key,
+                    request.all_token_ids[:blocks * hash_block_size],
+                    tuple(new_block_hashes[:blocks]),
+                )
         return new_block_hashes
 
     return request_block_hasher

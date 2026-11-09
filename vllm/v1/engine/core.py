@@ -236,7 +236,13 @@ class EngineCore:
             init_none_hash(caching_hash_fn)
 
             self.request_block_hasher = get_request_block_hasher(
-                hash_block_size, caching_hash_fn
+                hash_block_size,
+                caching_hash_fn,
+                # Bound the CPU-only hash snapshot even for million-token
+                # model contexts. This does not retain or pin any KV blocks.
+                max_cached_prompt_tokens=(
+                    131072 if vllm_config.cache_config.enable_prefix_caching else 0
+                ),
             )
 
         self.step_fn = (
