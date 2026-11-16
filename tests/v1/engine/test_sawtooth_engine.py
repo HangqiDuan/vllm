@@ -45,6 +45,7 @@ class LazyFuture(Future):
 
 class Scheduler:
     def __init__(self, count):
+        self.sawtooth_balance_prefill_pairs = False
         self.waiting = deque(f"request-{index}" for index in range(count))
         self.kv_holding_waiting = []
         self.running = []
@@ -504,7 +505,8 @@ def test_same_request_prefill_heads_precede_both_tails_without_terminal_wait():
             if not self.running:
                 rid = self.waiting.popleft()
                 request = SimpleNamespace(
-                    request_id=rid, num_in_flight_tokens=0,
+                    request_id=rid,
+                    num_in_flight_tokens=0,
                     is_finished=lambda: False,
                 )
                 self.running.append(request)
@@ -696,8 +698,8 @@ class AdmissionScheduler(Scheduler):
     def schedule(self, throttle):
         self.schedule_calls += 1
         self.available_batches.append(self.sawtooth_available_batches)
-        decode_only = self.sawtooth_decode_only
-        prefill_only = self.sawtooth_prefill_only
+        decode_only = getattr(self, "sawtooth_decode_only", False)
+        prefill_only = getattr(self, "sawtooth_prefill_only", False)
         assert not (decode_only and prefill_only)
         self.modes.append((decode_only, prefill_only))
         if not prefill_only and self.ready_decodes:
@@ -721,24 +723,53 @@ def command_order(executor):
     ]
 
 
+def test_budget_pair_accepts_independent_prefill_after_decode_head():
+    initial, _, executor = make_engine(0, 3, 2)
+    scheduler = AdmissionScheduler(1)
+    scheduler.sawtooth_request_ledger = SawtoothRequestLedger()
+    scheduler.sawtooth_mark_head_enqueued = lambda output: None
+    initial.core.scheduler = scheduler
+    initial.core.vllm_config.additional_config["sawtooth_pipeline"][
+        "enable_prefill_chunk_overlap"
+    ] = True
+    engine = SawtoothEngine(initial.core)
+    reads = []
+    executor.before_response = lambda: reads.append(True)
+    engine.step()
+    scheduler.waiting.append("independent-prefill")
+    engine.step()
+    assert command_order(executor) == [("decode-0", 0), ("independent-prefill", 0)]
+    scheduler.waiting.append("next-pair")
+    engine.step()
+    engine.step()
+    assert command_order(executor)[-2:] == [
+        ("decode-0", 1),
+        ("independent-prefill", 1),
+    ]
+    assert not reads
+    engine.step()
+    assert command_order(executor)[-1] == ("next-pair", 0)
+    assert scheduler.modes == [(False, False)] * 3
+
+
 @pytest.mark.parametrize("rounds", [2, 3, 4])
-def test_fresh_prefill_follows_admitted_decode_tail_without_terminal_wait(rounds):
+def test_independent_heads_can_pair_before_continuations_without_host_wait(rounds):
     engine, _, executor = make_engine(0, 3, rounds)
     scheduler = AdmissionScheduler(1)
     engine.core.scheduler = scheduler
     reads = []
     executor.before_response = lambda: reads.append(True)
-    engine.step()  # D0, no cohort frozen yet.
+    engine.step()
     scheduler.waiting.append("fresh-prefill")
-    for _ in range(rounds):
+    engine.step()
+    for _ in range(2 * (rounds - 1)):
         engine.step()
-    assert command_order(executor) == [("decode-0", r) for r in range(rounds)] + [
-        ("fresh-prefill", 0)
+    assert command_order(executor) == [
+        (rid, r) for r in range(rounds) for rid in ("decode-0", "fresh-prefill")
     ]
-    assert executor.samples == ["decode-0"]
+    assert executor.samples == ["decode-0", "fresh-prefill"]
     assert not reads and not scheduler.updates
-    assert scheduler.modes == [(False, False), (False, True)]
-    assert len({b.slot_id for b in engine.active}) == 2
+    assert scheduler.modes == [(False, False)] * 2
 
 
 @pytest.mark.parametrize("rounds", [2, 3, 4])
@@ -775,71 +806,39 @@ def test_decode_cohort_keeps_initial_and_refill_window_order(rounds, capacity):
 
 
 @pytest.mark.parametrize("rounds", [2, 3, 4])
-def test_waiting_prefill_gets_a_slot_after_bounded_decode_cohort(rounds):
-    engine, _, executor = make_engine(0, 3, rounds)
-    scheduler = AdmissionScheduler(30)
-    engine.core.scheduler = scheduler
-    engine.step()
-    scheduler.waiting.append("waiting-prefill")
-    # Ready D heads still fill the initial window despite a waiting P.
-    engine.step()
-    engine.step()
-    assert command_order(executor) == [(f"decode-{b}", 0) for b in range(3)]
-    for _ in range(3 * (rounds - 1)):
-        engine.step()
-    assert len(executor.commands) == 3 * rounds
-    assert not scheduler.updates
-    engine.step()  # No free slot: retire precisely the oldest terminal.
-    assert scheduler.updates == ["decode-0"]
-    engine.step()  # P-only opportunity must beat the other 27 ready decodes.
-    assert command_order(executor)[-1] == ("waiting-prefill", 0)
-    assert scheduler.modes[-1] == (False, True)
-    assert len(executor.commands) == 3 * rounds + 1
-
-
-@pytest.mark.parametrize("rounds", [2, 3, 4])
-def test_deferred_decode_waits_for_old_phase_but_not_for_its_own_terminal(rounds):
-    engine, _, executor = make_engine(1, 3, rounds)
-    # Freeze and finish the first P cohort's submissions without retiring it.
+def test_new_cohort_continuations_follow_old_phase_retirement(rounds):
+    engine, original, executor = make_engine(1, 3, rounds)
     for _ in range(rounds):
         engine.step()
-    original = engine.core.scheduler
     scheduler = AdmissionScheduler(1)
     scheduler.running.extend(original.running)
     scheduler.requests.update(original.requests)
     engine.core.scheduler = scheduler
-    engine.step()  # New D0 is outside the old frozen phase.
+    engine.step()
     scheduler.waiting.append("next-prefill")
-    engine.step()  # Old P terminal must retire before the new D tail is legal.
+    engine.step()
+    assert command_order(executor)[-2:] == [("decode-0", 0), ("next-prefill", 0)]
+    assert not scheduler.updates
+    engine.step()
     assert scheduler.updates == ["request-0"]
-    for _ in range(rounds):
+    for _ in range(2 * (rounds - 1)):
         engine.step()
     assert command_order(executor) == [("request-0", r) for r in range(rounds)] + [
-        ("decode-0", r) for r in range(rounds)
-    ] + [("next-prefill", 0)]
+        (rid, r) for r in range(rounds) for rid in ("decode-0", "next-prefill")
+    ]
     assert scheduler.updates == ["request-0"]
 
 
-@pytest.mark.parametrize("mode", ["decode", "prefill"])
-def test_failed_admission_attempt_does_not_retry_or_stop_continuation_progress(mode):
-    engine, _, executor = make_engine(0, 3, 2)
-    scheduler = AdmissionScheduler(2)
-    engine.core.scheduler = scheduler
+@pytest.mark.parametrize("has_decode", [False, True])
+def test_failed_admission_attempt_still_submits_existing_continuation(has_decode):
+    engine, scheduler, executor = make_engine(2, 3, 2)
     engine.step()
-    scheduler.waiting.append("waiting-prefill")
-    schedule = scheduler.schedule
+    engine.active[0].scheduler_output.sawtooth_has_decode = has_decode
     attempts = []
 
     def allocation_blocked(throttle):
-        selected = (
-            scheduler.sawtooth_decode_only
-            if mode == "decode"
-            else scheduler.sawtooth_prefill_only
-        )
-        if selected:
-            attempts.append(mode)
-            return Output("empty", 0)
-        return schedule(throttle)
+        attempts.append(True)
+        return Output("empty", 0)
 
     execute = executor.execute_model
 
@@ -852,98 +851,57 @@ def test_failed_admission_attempt_does_not_retry_or_stop_continuation_progress(m
 
     scheduler.schedule = allocation_blocked
     executor.execute_model = with_control
-    if mode == "prefill":
-        # Suppress the second D until the protected cohort has submitted its
-        # tail; otherwise independent D must fill the spare slots first.
-        scheduler.ready_decodes.clear()
-        engine.step()
     engine.step()
-    assert attempts == [mode]
-    assert command_order(executor) == [("decode-0", 0), ("decode-0", 1)]
+    assert attempts == [True]
+    assert command_order(executor) == [("request-0", 0), ("request-0", 1)]
     assert len(engine.controls) == 1
-    if mode == "prefill":
-        assert not engine.prefill_turn
-        assert scheduler.updates == ["decode-0"]
-    else:
-        assert not scheduler.updates
+    assert not scheduler.updates
 
 
-def test_decode_drain_survives_old_prefill_phase_retirement():
-    """A drain started on an old P tail must protect a deferred D cohort too."""
-    engine, original, executor = make_engine(1, 3, 4)
-    engine.step()  # P0
-    engine.step()  # P1 freezes the old cohort.
-    scheduler = AdmissionScheduler(1)
-    scheduler.running.extend(original.running)
-    scheduler.requests.update(original.requests)
-    engine.core.scheduler = scheduler
-    engine.step()  # D0 is outside the old frozen cohort.
-    engine.step()  # P2 starts the protected drain because D still has debt.
-    assert engine.decode_draining
-    assert engine.phase_limit == 0
-    assert command_order(executor)[-1] == ("request-0", 2)
+@pytest.mark.parametrize("decode_mask", [0, 0b010101, 0b111111])
+def test_pair_round_order_does_not_depend_on_prefill_decode_labels(decode_mask):
+    initial, scheduler, executor = make_engine(6, 3, 2)
+    scheduler.sawtooth_request_ledger = SawtoothRequestLedger()
+    scheduler.sawtooth_mark_head_enqueued = lambda output: None
+    initial.core.vllm_config.additional_config["sawtooth_pipeline"][
+        "enable_prefill_chunk_overlap"
+    ] = True
+    original_schedule = scheduler.schedule
 
-    # Both an independent D and a P arrive with a free slot. Neither may
-    # extend the set being drained, including across phase_limit clearing.
-    rid = "later-decode"
-    request = SimpleNamespace(
-        request_id=rid, num_in_flight_tokens=0, is_finished=lambda: False
-    )
-    scheduler.ready_decodes.append(rid)
-    scheduler.running.append(request)
-    scheduler.requests[rid] = request
-    scheduler.waiting.append("later-prefill")
-    engine.step()  # P3, not a new head.
-    assert engine.decode_draining
-    engine.step()  # Retire old P, making D's cohort legal.
-    assert scheduler.updates == ["request-0"]
-    assert engine.phase_limit is None
-    assert engine.decode_draining
-    assert len(engine.slots) == 2
-    for _ in range(3):
-        engine.step()  # D1, D2, D3; the spare slots stay unfilled.
-    assert command_order(executor) == [
-        ("request-0", 0),
-        ("request-0", 1),
-        ("decode-0", 0),
-        ("request-0", 2),
-        ("request-0", 3),
-        ("decode-0", 1),
-        ("decode-0", 2),
-        ("decode-0", 3),
-    ]
-    engine.step()  # The P-only opportunity precedes the ready independent D.
-    assert command_order(executor)[-1] == ("later-prefill", 0)
-    assert scheduler.modes[-1] == (False, True)
-    assert scheduler.updates == ["request-0"]  # No wait for D's own terminal.
-    assert list(scheduler.ready_decodes) == [rid]
-    for _ in range(100):
+    def labeled(throttle):
+        output = original_schedule(throttle)
+        index = int(output.request_id.split("-")[-1])
+        output.sawtooth_has_decode = bool(decode_mask & (1 << index))
+        return output
+
+    scheduler.schedule = labeled
+    engine = SawtoothEngine(initial.core)
+    for _ in range(80):
         if not engine and not scheduler.has_requests():
             break
         engine.step()
-    assert scheduler.updates == [
-        "request-0",
-        "decode-0",
-        "later-prefill",
-        "later-decode",
+        assert len(engine.active) <= 3
+    assert command_order(executor) == [
+        (f"request-{b}", r)
+        for start in (0, 2, 4)
+        for r in (0, 1)
+        for b in (start, start + 1)
     ]
+    assert scheduler.updates == [f"request-{b}" for b in range(6)]
     assert not engine and not executor.responses
 
 
-def test_failed_strict_decode_control_prevents_terminal_commit():
+def test_failed_admission_control_prevents_terminal_commit():
     """A positive D hint is not an allocation promise or a successful RPC."""
     engine, _, executor = make_engine(0, 3, 2)
     scheduler = AdmissionScheduler(2)
     engine.core.scheduler = scheduler
     engine.step()
-    schedule = scheduler.schedule
     attempts = []
 
     def allocation_blocked(throttle):
-        if scheduler.sawtooth_decode_only:
-            attempts.append(True)
-            return Output("empty", 0)
-        return schedule(throttle)
+        attempts.append(True)
+        return Output("empty", 0)
 
     execute = executor.execute_model
     control_futures = []
@@ -953,7 +911,7 @@ def test_failed_strict_decode_control_prevents_terminal_commit():
             return execute(output, non_block)
 
         def failed_response():
-            raise RuntimeError("strict decode control failed")
+            raise RuntimeError("admission control failed")
 
         future = LazyFuture(executor.responses, failed_response)
         control_futures.append(future)
@@ -966,30 +924,28 @@ def test_failed_strict_decode_control_prevents_terminal_commit():
     assert command_order(executor) == [("decode-0", 0), ("decode-0", 1)]
     assert not control_futures[0].done()
     assert not scheduler.updates
-    with pytest.raises(RuntimeError, match="strict decode control failed"):
+    with pytest.raises(RuntimeError, match="admission control failed"):
         for _ in range(10):
             engine.step()
     assert control_futures[0].done()
     assert not scheduler.updates  # No output/KV commit after the failed RPC.
 
 
-def test_prefill_only_empty_opportunity_without_active_batch_is_consumed_once():
+def test_empty_admission_without_active_batch_is_consumed_once():
     """After W=1 retirement, an empty P control must drain without rescheduling."""
     engine, _, executor = make_engine(0, 1, 2)
     scheduler = AdmissionScheduler(1)
     engine.core.scheduler = scheduler
     engine.step()
     scheduler.waiting.append("waiting-prefill")
-    engine.step()  # D1, no free slot for the P-only turn yet.
-    engine.step()  # Retire D; preserve the pending P-only opportunity.
-    assert not engine.active and engine.prefill_turn
+    engine.step()  # D1, no free slot for the next admission yet.
+    engine.step()  # Retire D; preserve the free admission slot.
+    assert not engine.active
     assert scheduler.updates == ["decode-0"]
     attempts = []
     updates = []
 
     def blocked_prefill(throttle):
-        assert scheduler.sawtooth_prefill_only
-        assert not scheduler.sawtooth_decode_only
         attempts.append(True)
         return Output("empty", 0)
 
@@ -1009,7 +965,6 @@ def test_prefill_only_empty_opportunity_without_active_batch_is_consumed_once():
     executor.execute_model = execute_control
     assert engine.step() == ({0: "metadata-progress"}, False)
     assert attempts == updates == [True]
-    assert not engine.prefill_turn
     assert not engine and not executor.responses
     assert list(scheduler.waiting) == ["waiting-prefill"]
 
@@ -1027,10 +982,10 @@ def test_single_slot_decode_guard_releases_prefill_after_slot_retirement(rounds)
     assert not scheduler.updates and not engine.slots
     engine.step()
     assert scheduler.updates == ["decode-0"]
-    assert engine.prefill_turn and len(engine.slots) == 1
+    assert len(engine.slots) == 1
     engine.step()
     assert command_order(executor)[-1] == ("waiting-prefill", 0)
-    assert scheduler.modes[-1] == (False, True)
+    assert scheduler.modes[-1] == (False, False)
     for _ in range(20):
         if not engine and not scheduler.has_requests():
             break

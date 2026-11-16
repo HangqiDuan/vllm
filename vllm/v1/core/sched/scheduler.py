@@ -74,6 +74,10 @@ from vllm.v1.metrics.stats import (
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.sawtooth import SawtoothRequestLedger
+from vllm.v1.sawtooth_trace import (
+    admission_snapshot,
+    get_sawtooth_schedule_trace,
+)
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -102,17 +106,17 @@ class Scheduler(SchedulerInterface):
         self.sawtooth_available_batches = 1
         self.sawtooth_pipeline_capacity = 1
         self.sawtooth_split_prefill_tail = False
+        self.sawtooth_pair_head: bool | None = None
         self._sawtooth_prefill_batches = 0
         self.sawtooth_balance_prefill_pairs = False
         self._sawtooth_pair_next_budget: int | None = None
         self._sawtooth_pair_candidate: int | None = None
         self._sawtooth_pair_budget_active = False
+        self._sawtooth_pair_prefill_budget: int | None = None
         # Per-schedule decisions: split this tail, or reserve its other partner.
         self._sawtooth_tail_candidates: dict[str, bool] = {}
         self.sawtooth_allow_early_admission = False
         self.sawtooth_defer_dependent_decode = False
-        self.sawtooth_decode_only = False
-        self.sawtooth_prefill_only = False
         # Match V2's fixed prefill_len, including output replay after preemption.
         self._sawtooth_prefill_lens: dict[str, int] = {}
         self.sawtooth_request_ledger = SawtoothRequestLedger()
@@ -681,6 +685,22 @@ class Scheduler(SchedulerInterface):
             for request in self.running
         )
 
+    def _sawtooth_waiter_ready(self, request: Request) -> bool:
+        """Readiness hint only; native admission owns promotion and KV updates."""
+        if request.num_in_flight_tokens or (
+            request.num_stale_output_tokens > 0 and not request.drop_stale_output
+        ):
+            return False
+        if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+            return True
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return request.request_id in self.finished_recving_kv_req_ids
+        if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+            structured = request.structured_output_request
+            grammar = structured.grammar if structured is not None else None
+            return grammar is not None and not isinstance(grammar, Exception)
+        return False
+
     def sawtooth_has_prefill_candidate(self, *, require_eligible: bool = False) -> bool:
         """A waiting P may still be blocked; one native admission may try it."""
         if not self.sawtooth_enabled:
@@ -695,16 +715,7 @@ class Scheduler(SchedulerInterface):
                 < self.max_num_running_reqs
             ):
                 for queue in (self.waiting, self.kv_holding_waiting):
-                    if any(
-                        request.status
-                        in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
-                        and not request.num_in_flight_tokens
-                        and not (
-                            request.num_stale_output_tokens > 0
-                            and not request.drop_stale_output
-                        )
-                        for request in queue
-                    ):
+                    if any(self._sawtooth_waiter_ready(request) for request in queue):
                         return True
         for request in self.running:
             count = self._sawtooth_running_tokens(request, self.current_step + 1)
@@ -712,8 +723,64 @@ class Scheduler(SchedulerInterface):
                 return True
         return False
 
+    def _sawtooth_is_pair_head(self) -> bool:
+        if self.sawtooth_pair_head is not None:
+            return self.sawtooth_pair_head
+        return self._sawtooth_prefill_batches % 2 == 0
+
+    def _sawtooth_chunk_admission_enabled(self) -> bool:
+        return (
+            self.sawtooth_enabled
+            and self.sawtooth_balance_prefill_pairs
+            and self.sawtooth_request_ledger.allow_prefill_overlap
+            and self.scheduler_config.enable_chunked_prefill
+            and not self.scheduler_reserve_full_isl
+            and not self.need_mamba_block_aligned_split
+            and not self.num_prefill_lookahead
+            and not self.num_lookahead_tokens
+            and not self.num_spec_tokens
+            and self.connector is None
+            and self.ec_connector is None
+            and self.lora_config is None
+        )
+
+    def _sawtooth_chunk_kv_limit(
+        self, request: Request, start: int, count: int, blocks, free: int
+    ) -> int:
+        """Find a fitting chunk with the allocator's block geometry."""
+        coordinator = self.kv_cache_manager.coordinator
+
+        def fits(tokens: int) -> bool:
+            end = start + tokens
+            return (
+                coordinator.get_num_blocks_to_allocate(
+                    request_id=request.request_id,
+                    num_tokens=end,
+                    new_computed_blocks=blocks,
+                    num_encoder_tokens=0,
+                    total_computed_tokens=start,
+                    num_local_computed_tokens=start,
+                    num_tokens_main_model=end,
+                    prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+                )
+                <= free
+            )
+
+        if free < 0:
+            return 0
+        if fits(count):
+            return count
+        low, high = 0, count
+        while low < high:
+            mid = (low + high + 1) // 2
+            if fits(mid):
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
     def _sawtooth_pair_budget(self, limit: int) -> int | None:
-        """Plan two prefill heads without waiting for future input arrivals.
+        """Balance prompt tokens across two heads, including mixed P/D pairs.
 
         KV estimates are conservative hints, not allocations or reservations.
         Normal admission still validates every request, including the partner.
@@ -722,7 +789,6 @@ class Scheduler(SchedulerInterface):
             not self.sawtooth_enabled
             or not self.sawtooth_balance_prefill_pairs
             or not self.sawtooth_request_ledger.allow_prefill_overlap
-            or self.sawtooth_decode_only
             or self._pause_state != PauseState.UNPAUSED
             or not self.scheduler_config.enable_chunked_prefill
             or self.need_mamba_block_aligned_split
@@ -734,16 +800,52 @@ class Scheduler(SchedulerInterface):
             or self.scheduler_config.long_prefill_token_threshold
         ):
             return None
-        # Do not change mixed/decode batch sizing.
-        if self.sawtooth_has_decode_candidate():
-            return None
-        if self._sawtooth_prefill_batches % 2:
-            return self._sawtooth_pair_next_budget
-        if not self.sawtooth_split_prefill_tail:
+        pair_head = self._sawtooth_is_pair_head()
+        if pair_head and not self.sawtooth_split_prefill_tail:
             return None
 
+        # Only ready decode candidates reserve room. Their admission still uses
+        # the normal token budget; no future sample or arrival is awaited.
+        decode_tokens = sum(
+            count
+            for request in self.running
+            if (count := self._sawtooth_running_tokens(request, self.current_step))
+            and self._sawtooth_is_decode(request, count)
+        )
+        limit = max(0, limit - decode_tokens)
+        if not pair_head:
+            if self._sawtooth_pair_next_budget is None:
+                return None
+            return min(limit, self._sawtooth_pair_next_budget)
+        if not limit:
+            return 0
+
         manager = self.kv_cache_manager
-        free = manager.block_pool.get_num_free_blocks()
+        decode_blocks = 0
+        if self._sawtooth_chunk_admission_enabled():
+            for request in self.running:
+                count = self._sawtooth_running_tokens(request, self.current_step)
+                if not count or not self._sawtooth_is_decode(request, count):
+                    continue
+                # Match allocate_slots' completed boundary, never the optimistic
+                # boundary still referenced by an in-flight chunk.
+                manager.coordinator.remove_skipped_blocks(
+                    request.request_id,
+                    max(0, request.num_computed_tokens - request.num_in_flight_tokens),
+                    num_prompt_tokens=request.num_prompt_tokens,
+                )
+                end = request.num_computed_tokens + count
+                decode_blocks += manager.coordinator.get_num_blocks_to_allocate(
+                    request_id=request.request_id,
+                    num_tokens=end,
+                    new_computed_blocks=manager.empty_kv_cache_blocks.blocks,
+                    num_encoder_tokens=0,
+                    total_computed_tokens=request.num_computed_tokens,
+                    num_local_computed_tokens=request.num_computed_tokens,
+                    num_tokens_main_model=end,
+                    prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+                )
+        free = max(0, manager.block_pool.get_num_free_blocks() - decode_blocks)
         available = 0
         waiting_slots = (
             self.max_num_running_reqs
@@ -776,18 +878,15 @@ class Scheduler(SchedulerInterface):
                 if (
                     waiting_slots <= 0
                     or request.num_in_flight_tokens
-                    or request.status not in (
-                        RequestStatus.WAITING, RequestStatus.PREEMPTED
-                    )
+                    or request.status
+                    not in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
                 ):
                     continue
                 if start == 0 and manager.prefix_cache_lookup_enabled(request):
                     # Read-only lookup: get_computed_blocks also emits cache
                     # events, which must remain tied to real admission.
-                    blocks, hit_tokens, _ = (
-                        manager.coordinator.find_longest_cache_hit(
-                            request.block_hashes, request.num_tokens - 1
-                        )
+                    blocks, hit_tokens, _ = manager.coordinator.find_longest_cache_hit(
+                        request.block_hashes, request.num_tokens - 1
                     )
                     # Match allocate_slots: retained groups can have hits
                     # beyond the common reusable prefix. Do not count those.
@@ -808,6 +907,13 @@ class Scheduler(SchedulerInterface):
             count = min(max(0, end - start), 2 * limit - available)
             if not count:
                 continue
+            watermark = manager.watermark_blocks if not running else 0
+            if self._sawtooth_chunk_admission_enabled():
+                count = self._sawtooth_chunk_kv_limit(
+                    request, start, count, blocks, free - watermark
+                )
+                if not count:
+                    break
             target = start + count
             # Honor full-sequence admission for a waiting request. Sum costs
             # conservatively: shared cache hits may be charged more than once.
@@ -823,6 +929,7 @@ class Scheduler(SchedulerInterface):
                 num_local_computed_tokens=start,
                 num_tokens_main_model=target,
                 apply_admission_cap=full,
+                prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
             )
             watermark = manager.watermark_blocks if not running else 0
             if needed + watermark > free:
@@ -844,14 +951,22 @@ class Scheduler(SchedulerInterface):
         self, request: Request, start: int, count: int, scheduled: dict[str, int]
     ) -> int:
         """Split only an odd final prefill batch with no live partner."""
+        if self._sawtooth_pair_prefill_budget is not None:
+            if self._sawtooth_is_decode(request, count):
+                return count
+            used = sum(
+                tokens
+                for rid, tokens in scheduled.items()
+                if not self._sawtooth_is_decode(self.requests[rid], tokens)
+            )
+            return min(count, max(0, self._sawtooth_pair_prefill_budget - used))
         if (
             not self.sawtooth_enabled
             or self._sawtooth_pair_budget_active
             or not self.sawtooth_split_prefill_tail
             # Preserve even-numbered heads across cohort boundaries.
-            or self._sawtooth_prefill_batches % 2 == 1
+            or not self._sawtooth_is_pair_head()
             or not self.sawtooth_request_ledger.allow_prefill_overlap
-            or self.sawtooth_decode_only
             # Preserve normal packing when this batch already contains work.
             # A tail inside a populated batch is not an isolated batch.
             or bool(scheduled)
@@ -987,25 +1102,23 @@ class Scheduler(SchedulerInterface):
                     self.parallel_config.pipeline_parallel_size,
                     self.sawtooth_pipeline_capacity,
                 )
-                return min(
-                    self.max_num_running_reqs, (len(live) + groups - 1) // groups
-                )
+                # Keep all ready Decode requests in one logical batch while
+                # allowing later batches to occupy other in-flight slots.
+                return self.max_num_running_reqs
         slots = self.sawtooth_available_batches
-        if not self.sawtooth_enabled or (
-            slots <= 1 and not (self.sawtooth_decode_only or self.sawtooth_prefill_only)
-        ):
+        if not self.sawtooth_enabled or slots <= 1:
             return self.max_num_running_reqs
 
         eligible = 0
+        has_decode = False
+        has_prefill = False
         for request in self.running:
             count = self._sawtooth_running_tokens(request, self.current_step)
             if not count or (defer_prefills and request.is_prefill_chunk):
                 continue
             is_decode = self._sawtooth_is_decode(request, count)
-            if (self.sawtooth_decode_only and not is_decode) or (
-                self.sawtooth_prefill_only and is_decode
-            ):
-                continue
+            has_decode |= is_decode
+            has_prefill |= not is_decode
             eligible += 1
 
         waiting_capacity = max(
@@ -1015,27 +1128,24 @@ class Scheduler(SchedulerInterface):
             - self.num_waiting_for_streaming_input,
         )
         for queue in (self.kv_holding_waiting, self.waiting):
-            if self.sawtooth_decode_only or waiting_capacity == 0:
+            if waiting_capacity == 0:
                 break
             for request in queue:
                 if waiting_capacity == 0:
                     break
-                if (
-                    request.status
-                    not in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
-                    or request.num_in_flight_tokens
-                    or (
-                        request.num_stale_output_tokens > 0
-                        and not request.drop_stale_output
-                    )
-                    or (
-                        defer_prefills
-                        and request.num_computed_tokens < request.num_tokens - 1
-                    )
+                if not self._sawtooth_waiter_ready(request) or (
+                    defer_prefills
+                    and request.num_computed_tokens < request.num_tokens - 1
                 ):
                     continue
+                has_prefill = True
                 eligible += 1
                 waiting_capacity -= 1
+
+        # Cohort splitting must not leave ready P/D apart while token budget
+        # remains. Pure workloads retain their pipeline batching policy.
+        if has_decode and has_prefill:
+            return self.max_num_running_reqs
 
         # A blocked waiter can become ready during the regular admission loop.
         # Keep that opportunity even when the initial estimate was zero.
@@ -1046,11 +1156,7 @@ class Scheduler(SchedulerInterface):
         self._sawtooth_tail_candidates.clear()
         self._sawtooth_pair_candidate = None
         self._sawtooth_pair_budget_active = False
-        if self.sawtooth_decode_only or self.sawtooth_prefill_only:
-            if not self.sawtooth_enabled:
-                raise ValueError("Sawtooth selection requires sawtooth scheduling")
-            if self.sawtooth_decode_only and self.sawtooth_prefill_only:
-                raise ValueError("Sawtooth decode-only and prefill-only are exclusive")
+        self._sawtooth_pair_prefill_budget = None
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1098,20 +1204,26 @@ class Scheduler(SchedulerInterface):
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
-        if self.sawtooth_enabled and (
-            self.sawtooth_decode_only or self.sawtooth_prefill_only
-        ):
-            # A bounded explicit opportunity is independent of DP throttling.
-            defer_prefills = False
         request_cap = self._sawtooth_request_cap(defer_prefills)
-        pair_budget = None if defer_prefills else self._sawtooth_pair_budget(
-            min(token_budget, input_budget)
+        pair_budget = (
+            None
+            if defer_prefills
+            else self._sawtooth_pair_budget(min(token_budget, input_budget))
         )
         if pair_budget is not None:
-            token_budget = min(token_budget, pair_budget)
-            input_budget = min(input_budget, pair_budget)
+            self._sawtooth_pair_prefill_budget = pair_budget
             request_cap = self.max_num_running_reqs
             self._sawtooth_pair_budget_active = True
+
+        admission_trace = get_sawtooth_schedule_trace()
+        admission = None
+        if self.sawtooth_enabled and admission_trace.enabled:
+            admission = admission_snapshot(
+                self,
+                request_cap,
+                token_budget,
+                defer_prefills,
+            )
 
         # `long_prefill_token_threshold` exists to stop a long prefill from
         # starving other requests of the token budget. When it is the only
@@ -1137,6 +1249,8 @@ class Scheduler(SchedulerInterface):
             if at_request_cap and not self._sawtooth_can_pack_prefill_tail(
                 num_scheduled_tokens
             ):
+                if admission is not None:
+                    admission["running_stop"] = "request_cap"
                 break
             request = self.running[req_index]
             if self.sawtooth_enabled:
@@ -1144,12 +1258,7 @@ class Scheduler(SchedulerInterface):
                     request, self.current_step
                 )
                 is_decode = self._sawtooth_is_decode(request, candidate_tokens)
-                if (
-                    not candidate_tokens
-                    or (at_request_cap and is_decode)
-                    or (self.sawtooth_decode_only and not is_decode)
-                    or (self.sawtooth_prefill_only and is_decode)
-                ):
+                if not candidate_tokens or (at_request_cap and is_decode):
                     req_index += 1
                     continue
             if input_budget <= draft_slots:
@@ -1412,11 +1521,7 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if (
-            not preempted_reqs
-            and self._pause_state != PauseState.PAUSED_ALL
-            and not (self.sawtooth_enabled and self.sawtooth_decode_only)
-        ):
+        if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
 
@@ -1433,6 +1538,8 @@ class Scheduler(SchedulerInterface):
                 if at_request_cap and not self._sawtooth_can_pack_prefill_tail(
                     num_scheduled_tokens
                 ):
+                    if admission is not None:
+                        admission["waiting_stop"] = "request_cap"
                     break
                 # Requests holding KV blocks are always drained first, and are
                 # the only ones admitted under PAUSED_NEW (e.g. async KV loads).
@@ -1740,6 +1847,23 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = self._reserve_prefill_lookahead(
                         request, num_computed_tokens, num_new_tokens
                     )
+                    if (
+                        self._sawtooth_chunk_admission_enabled()
+                        and not request.has_encoder_inputs
+                        and not request.use_structured_output
+                        and not request.resumable
+                        and not num_external_computed_tokens
+                        and not num_replay_tokens
+                    ):
+                        manager = self.kv_cache_manager
+                        watermark = manager.watermark_blocks if self.running else 0
+                        num_new_tokens = self._sawtooth_chunk_kv_limit(
+                            request,
+                            num_computed_tokens,
+                            num_new_tokens,
+                            new_computed_blocks.blocks,
+                            manager.block_pool.get_num_free_blocks() - watermark,
+                        )
                     num_new_tokens = self._sawtooth_split_tail_tokens(
                         request,
                         num_computed_tokens,
@@ -2091,6 +2215,20 @@ class Scheduler(SchedulerInterface):
             self.sched_step_seq += 1
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
+            if admission is not None:
+                admission.update(
+                    selected=dict(num_scheduled_tokens),
+                    selected_kinds={
+                        rid: "D"
+                        if self._sawtooth_is_decode(self.requests[rid], n)
+                        else "P"
+                        for rid, n in num_scheduled_tokens.items()
+                    },
+                    remaining_token_budget=token_budget,
+                    remaining_input_budget=input_budget,
+                    preempted_req_ids=[r.request_id for r in preempted_reqs],
+                )
+                admission_trace.emit("scheduler.admission", admission)
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
@@ -2179,18 +2317,33 @@ class Scheduler(SchedulerInterface):
             )
             # Count accepted prefill heads, including packed batches, once.
             # Empty probes, decode and virtual continuations do not advance parity.
-            if any(
+            has_prefill = any(
                 not self._sawtooth_is_decode(self.requests[rid], count)
                 for rid, count in num_scheduled_tokens.items()
+            )
+            if num_scheduled_tokens and (
+                self.sawtooth_pair_head is not None or has_prefill
             ):
                 # Publish a plan only after successful admission. Empty probes
                 # do not consume the partner budget or advance pair parity.
-                self._sawtooth_pair_next_budget = (
-                    self._sawtooth_pair_candidate
-                    if self._sawtooth_prefill_batches % 2 == 0
-                    and self._sawtooth_pair_budget_active
-                    else None
-                )
+                if (
+                    self._sawtooth_is_pair_head()
+                    and not has_prefill
+                    and self.sawtooth_balance_prefill_pairs
+                ):
+                    # 纯 D 开头时，第二块只允许已就绪的 D，不拆小 P 凑对。
+                    # 这里限制的是 P 预算，D 仍按原依赖和 token 预算准入。
+                    # 无可用 D 则空调度，推进本批；P 留到下一对重新算预算。
+                    self._sawtooth_pair_next_budget = 0
+                else:
+                    self._sawtooth_pair_next_budget = (
+                        self._sawtooth_pair_candidate
+                        if self._sawtooth_is_pair_head()
+                        and has_prefill
+                        and self._sawtooth_pair_budget_active
+                        else None
+                    )
+            if has_prefill:
                 self._sawtooth_prefill_batches += 1
             scheduler_output.sawtooth_request_steps = {
                 rid: self.sawtooth_request_ledger.admit(

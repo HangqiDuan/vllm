@@ -8,7 +8,11 @@ from typing import Any
 
 from vllm.distributed.sawtooth import get_sawtooth_plan
 from vllm.v1.sawtooth import SawtoothExecution, SawtoothRoundSubmitted
-from vllm.v1.sawtooth_trace import command_context, get_sawtooth_trace
+from vllm.v1.sawtooth_trace import (
+    command_context,
+    get_sawtooth_schedule_trace,
+    get_sawtooth_trace,
+)
 
 
 @dataclass
@@ -49,8 +53,6 @@ class SawtoothEngine:
         self.next_batch_id = 0
         self.command_seq = 0
         self.phase_limit: int | None = None
-        self.decode_draining = False
-        self.prefill_turn = False
 
     def __bool__(self):
         return bool(self.active or self.controls)
@@ -73,8 +75,6 @@ class SawtoothEngine:
                 phase_limit=self.phase_limit,
                 free_slots=len(self.slots),
                 active_batches=len(self.active),
-                decode_draining=self.decode_draining,
-                prefill_turn=self.prefill_turn,
             )
         with self.trace.span("engine.dispatch", context):
             batch.exec_future = self.core.model_executor.execute_model(
@@ -93,20 +93,18 @@ class SawtoothEngine:
             # round zero on the same FIFO. This is not a device completion.
             self.core.scheduler.sawtooth_mark_tail_enqueued(batch.scheduler_output)
 
-    def _prefill_pair_blocks_admission(self):
+    def _pair_blocks_admission(self):
         if not (
             self.plan.config.enable_prefill_chunk_overlap
             and self.plan.pipeline_size == 2
             and self.plan.virtual_size == 2
         ):
             return False
-        # Slot capacity bounds live ownership, not the size of a prefill pair.
+        # Slot capacity bounds live ownership, not the size of a batch pair.
         # Older frozen tails may still own the third slot while the next two
         # heads form a pair. Never let a third head extend that new pair.
         if self.phase_limit is not None and any(
-            batch.batch_id <= self.phase_limit
-            and not batch.scheduler_output.sawtooth_has_decode
-            for batch in self.rounds
+            batch.batch_id <= self.phase_limit for batch in self.rounds
         ):
             # Finish submitting both tails before admitting the next pair.
             return True
@@ -115,14 +113,12 @@ class SawtoothEngine:
             for batch in self.rounds
             if self.phase_limit is None or batch.batch_id > self.phase_limit
         ]
-        return len(pending) >= 2 and all(
-            not batch.scheduler_output.sawtooth_has_decode for batch in pending
-        )
+        return len(pending) >= 2
 
-    def _advance_submitted_prefill_pair(self):
+    def _advance_submitted_pair(self):
         # Host retirement owns KV publication and slot reuse. It need not gate
-        # submitting another complete prefill pair after all older tails are
-        # already on every worker's FIFO. Decode/mixed cohorts keep their drain.
+        # submitting another complete pair after all older tails are already
+        # on every worker's FIFO. Request-ledger guards certify successors.
         if not (
             self.plan.config.enable_prefill_chunk_overlap
             and self.plan.pipeline_size == 2
@@ -130,10 +126,6 @@ class SawtoothEngine:
             and self.phase_limit is not None
             and len(self.rounds) == 2
             and all(batch.batch_id > self.phase_limit for batch in self.rounds)
-            and all(
-                not batch.scheduler_output.sawtooth_has_decode
-                for batch in self.active
-            )
             and not self.controls
         ):
             return
@@ -141,14 +133,10 @@ class SawtoothEngine:
 
     def _can_admit(self):
         scheduler = self.core.scheduler
-        if self._prefill_pair_blocks_admission():
+        if self._pair_blocks_admission():
             return False
         if not self.slots or not scheduler.has_requests():
             return False
-        if scheduler.sawtooth_decode_only:
-            return scheduler.sawtooth_has_decode_candidate()
-        if scheduler.sawtooth_prefill_only:
-            return scheduler.sawtooth_has_prefill_candidate()
         return bool(scheduler.waiting or scheduler.kv_holding_waiting) or any(
             scheduler.sawtooth_can_schedule(req) and not req.is_finished()
             for req in scheduler.running
@@ -207,6 +195,15 @@ class SawtoothEngine:
 
     def _schedule(self):
         self.core.scheduler.sawtooth_available_batches = len(self.slots)
+        # P, PD and D heads all occupy a position in the same execution pair.
+        self.core.scheduler.sawtooth_pair_head = (
+            not any(
+                self.phase_limit is None or batch.batch_id > self.phase_limit
+                for batch in self.rounds
+            )
+            if self.core.scheduler.sawtooth_balance_prefill_pairs
+            else None
+        )
         # A frozen older cohort may still own slots, but cannot partner a new
         # head. Its FIFO retirement releases room before the new continuation.
         self.core.scheduler.sawtooth_split_prefill_tail = bool(
@@ -220,7 +217,31 @@ class SawtoothEngine:
                 for batch in self.rounds
             )
         )
-        return self.core.scheduler.schedule(self.core._should_throttle_prefills())
+        output = self.core.scheduler.schedule(self.core._should_throttle_prefills())
+        trace = get_sawtooth_schedule_trace()
+        if trace.enabled:
+            trace.emit(
+                "engine.admission",
+                dict(
+                    scheduler_step=self.core.scheduler.current_step,
+                    batch_id=self.next_batch_id
+                    if output.total_num_scheduled_tokens
+                    else None,
+                    num_tokens=output.total_num_scheduled_tokens,
+                    selected=dict(output.num_scheduled_tokens),
+                    phase_limit=self.phase_limit,
+                    active_batch_ids=[batch.batch_id for batch in self.active],
+                    pending_rounds=[
+                        dict(
+                            batch_id=batch.batch_id,
+                            next_round=batch.next_round,
+                            has_decode=batch.scheduler_output.sawtooth_has_decode,
+                        )
+                        for batch in self.rounds
+                    ],
+                ),
+            )
+        return output
 
     def step(self):
         if self.plan.config.enable_prefill_chunk_overlap:
@@ -244,43 +265,15 @@ class SawtoothEngine:
 
         scheduler = self.core.scheduler
         scheduler.sawtooth_defer_dependent_decode = False
-        decode_debt = any(
-            batch.scheduler_output.sawtooth_has_decode for batch in self.rounds
-        )
-        if self.decode_draining and not decode_debt:
-            self.decode_draining = False
-            self.prefill_turn = True
-        scheduler.sawtooth_decode_only = False
-        scheduler.sawtooth_prefill_only = False
-        if not self.decode_draining:
-            if decode_debt:
-                # Fill spare slots with independent decodes before freezing
-                # their cohort. A fresh P head must not precede an admitted
-                # decode's still-unsubmitted continuation on the worker FIFO.
-                scheduler.sawtooth_decode_only = True
-            elif self.prefill_turn:
-                if scheduler.sawtooth_has_prefill_candidate():
-                    # Running-first auto selection plus the request cap can
-                    # otherwise give every slot to D indefinitely. One P-only
-                    # attempt supplies a real opportunity at this safe boundary.
-                    scheduler.sawtooth_prefill_only = True
-                else:
-                    self.prefill_turn = False
-
-        # Probe with the old filter cleared: a previous P opportunity must
-        # not suppress independent decode admission after prefills finish.
+        # A sampled successor must not insert a wait ahead of ready prompt
+        # work. Independent decodes remain eligible in the same batch.
         scheduler.sawtooth_defer_dependent_decode = (
             self.plan.config.enable_prefill_chunk_overlap
-            and not scheduler.sawtooth_decode_only
             and scheduler.sawtooth_has_prefill_candidate(require_eligible=True)
         )
 
-        if not self.decode_draining and self._can_admit():
+        if self._can_admit():
             output = self._schedule()
-            if scheduler.sawtooth_prefill_only:
-                # An empty result can carry native allocation/grammar/cleanup
-                # progress. Do not retry schedule or spin until P is accepted.
-                self.prefill_turn = False
             if output.total_num_scheduled_tokens:
                 slot = self.slots.popleft()
                 self.generations[slot] += 1
@@ -297,11 +290,11 @@ class SawtoothEngine:
             future = self.core.model_executor.execute_model(output, non_block=True)
             self.controls.append((output, future))
 
-        self._advance_submitted_prefill_pair()
+        self._advance_submitted_pair()
         if self.phase_limit is None and self.rounds:
             # Freeze the cohort when its first continuation is submitted. A
-            # refill can submit round zero. Complete pure-prefill pairs may
-            # advance above; other cohorts keep the retirement/refill boundary.
+            # refill can submit round zero. Complete two-round pairs may
+            # advance above without waiting for host retirement.
             self.phase_limit = self.next_batch_id - 1
         eligible = None
         if self.phase_limit is not None:
@@ -314,11 +307,6 @@ class SawtoothEngine:
                 None,
             )
         if eligible is not None:
-            if decode_debt:
-                # No new head may extend this bounded drain. Release it as soon
-                # as the existing D tails and sample RPCs have been submitted;
-                # never wait for their device or host completion to admit P.
-                self.decode_draining = True
             batch = self.rounds[eligible]
             del self.rounds[eligible]
             self._dispatch(batch, batch.next_round)

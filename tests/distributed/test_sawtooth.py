@@ -117,6 +117,7 @@ def test_disabled_keeps_ordinary_pp_and_enabled_rejects_speculation():
 @pytest.mark.parametrize("pcp,tp,pp", [(4, 1, 2), (2, 1, 2), (4, 2, 2), (4, 1, 1)])
 def test_pcp4_tp1_pp2_capability_is_supported(pcp, tp, pp):
     from vllm.distributed.sawtooth import validate_sawtooth_capabilities
+
     config = SimpleNamespace(
         additional_config={"sawtooth_pipeline": {"enabled": True}},
         use_v2_model_runner=True,
@@ -135,10 +136,39 @@ def test_pcp4_tp1_pp2_capability_is_supported(pcp, tp, pp):
 
 def test_sas_metadata_reuse_is_explicit_and_requires_boolean():
     from types import SimpleNamespace
-    from vllm.distributed.sawtooth import SawtoothConfig
+
     import pytest
+
+    from vllm.distributed.sawtooth import SawtoothConfig
+
     assert not SawtoothConfig().enable_sas_metadata_reuse
-    config = SimpleNamespace(additional_config={"sawtooth_pipeline": {"enable_sas_metadata_reuse": True}})
+    config = SimpleNamespace(
+        additional_config={"sawtooth_pipeline": {"enable_sas_metadata_reuse": True}}
+    )
     assert SawtoothConfig.from_vllm_config(config).enable_sas_metadata_reuse
     with pytest.raises(ValueError):
         SawtoothConfig(enable_sas_metadata_reuse="true")
+
+
+# Decode reuse is separately selectable so Prefill remains identical in A/B runs.
+def test_decode_sas_reuse_config_is_explicit_and_boolean():
+    from types import SimpleNamespace
+
+    from vllm.distributed.sawtooth import SawtoothConfig
+
+    assert not SawtoothConfig().enable_decode_sas_metadata_reuse
+    cfg = SimpleNamespace(
+        additional_config={
+            "sawtooth_pipeline": {
+                "enable_decode_sas_metadata_reuse": True,
+            }
+        }
+    )
+    assert SawtoothConfig.from_vllm_config(cfg).enable_decode_sas_metadata_reuse
+    cfg.additional_config["sawtooth_pipeline"]["enable_decode_sas_metadata_reuse"] = (
+        "true"
+    )
+    import pytest
+
+    with pytest.raises(ValueError, match="enable_decode_sas_metadata_reuse"):
+        SawtoothConfig.from_vllm_config(cfg)

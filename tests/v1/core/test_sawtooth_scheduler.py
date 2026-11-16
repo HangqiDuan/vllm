@@ -7,6 +7,7 @@ import sys
 from contextlib import suppress
 from dataclasses import replace
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -69,6 +70,165 @@ def result(output, sample=True):
         prompt_logprobs_dict={},
         pooler_output=[],
     )
+
+
+@pytest.mark.parametrize("slots", [1, 2, 3])
+def test_budget_admission_mixes_ready_decode_with_waiting_prefill(slots):
+    sched = scheduler(max_num_seqs=4, max_num_batched_tokens=64, max_model_len=256)
+    decode, prefill = create_requests(2, num_tokens=16, max_tokens=8)
+    sched.add_request(decode)
+    first = sched.schedule()
+    sched.sawtooth_mark_tail_enqueued(first)
+    sched.update_from_output(first, result(first))
+    sched.add_request(prefill)
+    sched.sawtooth_available_batches = slots
+    output = sched.schedule()
+    assert output.num_scheduled_tokens == {decode.request_id: 1, prefill.request_id: 16}
+
+
+@pytest.mark.parametrize("kind", ["grammar", "remote_kv"])
+@pytest.mark.parametrize("ready", [False, True])
+def test_budget_admission_recognizes_completed_waiter(kind, ready, monkeypatch):
+    sched = scheduler(max_num_seqs=4, max_num_batched_tokens=64, max_model_len=256)
+    decode, prefill = create_requests(2, num_tokens=16, max_tokens=8)
+    sched.add_request(decode)
+    first = sched.schedule()
+    sched.sawtooth_mark_tail_enqueued(first)
+    sched.update_from_output(first, result(first))
+    sched.add_request(prefill)
+    sched.sawtooth_available_batches = 2
+    if kind == "grammar":
+        prefill.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+        prefill.structured_output_request = SimpleNamespace(
+            grammar=object() if ready else None
+        )
+    else:
+        prefill.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        if ready:
+            sched.finished_recving_kv_req_ids.add(prefill.request_id)
+        # Isolate remote transfer bookkeeping; real admission still promotes
+        # status and allocates the local KV through the normal scheduler loop.
+        monkeypatch.setattr(
+            sched,
+            "_update_waiting_for_remote_kv",
+            lambda req: sched.finished_recving_kv_req_ids.remove(req.request_id),
+        )
+    status = prefill.status
+    finished = set(sched.finished_recving_kv_req_ids)
+    assert sched.sawtooth_has_prefill_candidate(require_eligible=True) == ready
+    assert sched._sawtooth_request_cap(False) == (4 if ready else 1)
+    assert prefill.status == status
+    assert sched.finished_recving_kv_req_ids == finished
+    output = sched.schedule()
+    expected = {decode.request_id: 1}
+    if ready:
+        expected[prefill.request_id] = 16
+    assert output.num_scheduled_tokens == expected
+
+
+def test_failed_grammar_is_not_a_ready_prefill_hint():
+    sched = scheduler(max_num_seqs=4, max_num_batched_tokens=64, max_model_len=256)
+    (request,) = create_requests(1, num_tokens=16, max_tokens=8)
+    sched.add_request(request)
+    request.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+    request.structured_output_request = SimpleNamespace(grammar=ValueError("invalid"))
+    assert not sched.sawtooth_has_prefill_candidate(require_eligible=True)
+    assert not sched.grammar_compile_error_reqs  # hint must not mutate lifecycle
+
+
+def test_budget_admission_uses_remainder_for_prefill_after_ready_decodes():
+    sched = scheduler(max_num_seqs=4, max_num_batched_tokens=64, max_model_len=256)
+    a, b, prefill = create_requests(3, num_tokens=16, max_tokens=8)
+    for req in (a, b):
+        sched.add_request(req)
+    first = sched.schedule()
+    sched.sawtooth_mark_tail_enqueued(first)
+    sched.update_from_output(first, result(first))
+    sched.add_request(prefill)
+    sched.sawtooth_available_batches = 3
+    sched.max_num_scheduled_tokens = 5
+    output = sched.schedule()
+    assert output.num_scheduled_tokens == {
+        a.request_id: 1,
+        b.request_id: 1,
+        prefill.request_id: 3,
+    }
+
+
+def test_admission_trace_exposes_ready_mixed_selection(tmp_path, monkeypatch):
+    """A diagnostic must distinguish policy exclusion from a sample dependency."""
+    import vllm.v1.sawtooth_trace as tracing
+
+    trace_dir = tmp_path / "admission"
+    monkeypatch.setenv("VLLM_SAWTOOTH_SCHEDULE_TRACE_DIR", str(trace_dir))
+    monkeypatch.setattr(tracing, "_schedule_trace", None, raising=False)
+    sched = scheduler(max_num_batched_tokens=64, max_model_len=256)
+    decode, prefill = create_requests(2, num_tokens=16, max_tokens=8)
+    sched.add_request(decode)
+    first = sched.schedule()
+    sched.update_from_output(first, result(first))
+    sched.add_request(prefill)
+    sched.sawtooth_available_batches = 3
+    output = sched.schedule()
+    assert output.num_scheduled_tokens == {decode.request_id: 1, prefill.request_id: 16}
+
+    files = list(trace_dir.glob("*.jsonl"))
+    assert len(files) == 1
+    rows = [json.loads(line) for line in files[0].read_text().splitlines()]
+    row = rows[-1]
+    state = next(r for r in row["requests"] if r["req_id"] == decode.request_id)
+    assert state["candidate_tokens"] == 1
+    assert state["in_flight_tokens"] == 0
+    assert state["blockers"] == []
+    assert row["admission_policy"] == "ready_budget"
+    assert row["selected"] == {decode.request_id: 1, prefill.request_id: 16}
+    assert row["selected_kinds"] == {decode.request_id: "D", prefill.request_id: "P"}
+
+
+def test_admission_trace_snapshots_dependency_before_scheduling(
+    tmp_path, monkeypatch, refill_boundary
+):
+    import vllm.v1.sawtooth_trace as tracing
+
+    trace_dir = tmp_path / "dependency"
+    monkeypatch.setenv("VLLM_SAWTOOTH_SCHEDULE_TRACE_DIR", str(trace_dir))
+    monkeypatch.setattr(tracing, "_schedule_trace", None, raising=False)
+    sched, requests, _, fresh = refill_boundary(num_running=1)
+    sched.sawtooth_defer_dependent_decode = True
+    output = sched.schedule()
+    assert output.num_scheduled_tokens == {fresh.request_id: 128}
+    files = list(trace_dir.glob("*.jsonl"))
+    assert len(files) == 1
+    row = json.loads(files[0].read_text().splitlines()[-1])
+    state = next(r for r in row["requests"] if r["req_id"] == requests[0].request_id)
+    assert state["candidate_tokens"] == 0
+    assert state["in_flight_tokens"] == 1
+    assert "dependent_decode" in state["blockers"]
+    assert row["selected_kinds"] == {fresh.request_id: "P"}
+
+
+def test_admission_trace_identifies_request_cap_with_spare_token_budget(
+    tmp_path, monkeypatch
+):
+    import vllm.v1.sawtooth_trace as tracing
+
+    trace_dir = tmp_path / "cap"
+    monkeypatch.setenv("VLLM_SAWTOOTH_SCHEDULE_TRACE_DIR", str(trace_dir))
+    monkeypatch.setattr(tracing, "_schedule_trace", None, raising=False)
+    sched = scheduler(max_num_batched_tokens=64, max_model_len=256)
+    requests = create_requests(2, num_tokens=16, max_tokens=8)
+    for request in requests:
+        sched.add_request(request)
+    first = sched.schedule()
+    sched.update_from_output(first, result(first))
+    sched.sawtooth_available_batches = 2
+    output = sched.schedule()
+    assert len(output.num_scheduled_tokens) == 1
+    row = json.loads(next(trace_dir.glob("*.jsonl")).read_text().splitlines()[-1])
+    assert row["running_stop"] == "request_cap"
+    assert row["remaining_token_budget"] == 63
+    assert all(r["candidate_tokens"] == 1 for r in row["requests"])
+    assert all(not r["blockers"] for r in row["requests"])
 
 
 def test_same_request_cannot_advance_while_any_virtual_round_is_live():
@@ -317,30 +477,23 @@ def test_refill_boundary_throttle_admits_one_token_new_prefill(prefill_length):
 
 
 @pytest.mark.parametrize("capacity_bound", [False, True])
-def test_strict_decode_skips_waiting_path_and_keeps_full_budget(
+def test_blocked_waiter_does_not_block_ready_decode(
     refill_boundary, monkeypatch, capacity_bound
 ):
     sched, requests, _, fresh = refill_boundary(num_running=2, committed_outputs=1)
     sched.prefill_capacity_bound = capacity_bound
-    sched.sawtooth_decode_only = True
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("decode-only accessed waiting promotion/prefix lookup")
-
-    monkeypatch.setattr(sched, "_handle_blocked_waiting_request", forbidden)
-    monkeypatch.setattr(sched, "_get_local_prefix_cache_hit", forbidden)
     fresh.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
-    before = sched.current_step
-    assert sched.sawtooth_has_decode_candidate()
-    assert sched.sawtooth_has_prefill_candidate()  # blocked P may try once later
-    assert sched.current_step == before
-    output = sched.schedule(throttle_prefills=True)
+    attempts = []
+
+    def blocked(request):
+        attempts.append(request.request_id)
+        return False
+
+    monkeypatch.setattr(sched, "_handle_blocked_waiting_request", blocked)
+    output = sched.schedule()
     assert output.num_scheduled_tokens == {r.request_id: 1 for r in requests}
-    assert output.sawtooth_has_decode
-    assert sched.current_step == before + 1
-    assert sched.max_num_scheduled_tokens == 10240
-    assert fresh.num_computed_tokens == 0
-    assert fresh in sched.waiting
+    assert attempts == [fresh.request_id]
+    assert fresh.num_computed_tokens == 0 and fresh in sched.waiting
 
 
 def test_candidate_hint_is_read_only_and_shares_final_token_guard(
@@ -357,8 +510,6 @@ def test_candidate_hint_is_read_only_and_shares_final_token_guard(
     assert not sched.sawtooth_has_decode_candidate()
     assert sched.sawtooth_has_prefill_candidate()
     assert before == (sched.current_step, [r.num_in_flight_tokens for r in requests])
-    sched.sawtooth_decode_only = True
-    assert not sched.schedule().num_scheduled_tokens
 
 
 def test_decode_hint_uses_next_step_cadence_and_actual_model_limit(refill_boundary):
@@ -369,8 +520,9 @@ def test_decode_hint_uses_next_step_cadence_and_actual_model_limit(refill_bounda
     assert sched.sawtooth_has_decode_candidate()
     sched.max_model_len = request.num_computed_tokens + 1
     assert not sched.sawtooth_has_decode_candidate()
-    sched.sawtooth_decode_only = True
-    assert not sched.schedule().num_scheduled_tokens
+    output = sched.schedule()
+    assert request.request_id not in output.num_scheduled_tokens
+    assert output.num_scheduled_tokens == {"fresh": 128}
 
 
 def test_decode_hint_can_fail_allocation_without_rescheduling(
@@ -388,58 +540,78 @@ def test_decode_hint_can_fail_allocation_without_rescheduling(
     assert not calls
     before = sched.current_step
     in_flight = request.num_in_flight_tokens
-    sched.sawtooth_decode_only = True
     output = sched.schedule()
     assert not output.num_scheduled_tokens
     assert not output.sawtooth_has_decode
-    assert calls == [request.request_id]
+    assert calls == [request.request_id, fresh.request_id]
     assert sched.current_step == before + 1
     assert request.num_in_flight_tokens == in_flight
     assert fresh.num_computed_tokens == 0
 
 
-def test_strict_decode_cap_counts_only_decode_candidates(refill_boundary):
-    sched, requests, _, _ = refill_boundary(num_running=12, committed_outputs=1)
-    for request in create_requests(
-        20, num_tokens=128, req_ids=[f"p{i}" for i in range(20)]
-    ):
+def test_mixed_candidates_share_native_sequence_and_token_budget(refill_boundary):
+    sched, requests, _, fresh = refill_boundary(num_running=12, committed_outputs=1)
+    added = create_requests(20, num_tokens=128, req_ids=[f"p{i}" for i in range(20)])
+    for request in added:
         sched.add_request(request)
     sched.sawtooth_available_batches = 3
-    sched.sawtooth_decode_only = True
-    assert sched._sawtooth_request_cap(False) == 4
+    assert sched._sawtooth_request_cap(False) == 64
     output = sched.schedule()
-    assert len(output.num_scheduled_tokens) == 4
-    assert set(output.num_scheduled_tokens) <= {r.request_id for r in requests}
-    assert output.total_num_scheduled_tokens == 4
+    assert output.num_scheduled_tokens == {
+        **{r.request_id: 1 for r in requests},
+        **{r.request_id: 128 for r in [fresh, *added]},
+    }
+    assert output.total_num_scheduled_tokens == 12 + 21 * 128
 
 
-def test_prefill_opportunity_excludes_decode_then_auto_restores(refill_boundary):
+def test_mixed_admission_classification_is_immutable(refill_boundary):
     sched, requests, _, fresh = refill_boundary(num_running=2, committed_outputs=1)
-    sched.sawtooth_prefill_only = True
-    assert sched._sawtooth_request_cap(False) == 1
-    prefill = sched.schedule(throttle_prefills=True)
-    assert prefill.num_scheduled_tokens == {fresh.request_id: 128}
-    assert not prefill.sawtooth_has_decode
-    assert sched._sawtooth_prefill_lens[fresh.request_id] == 128
-    sched.sawtooth_prefill_only = False
     output = sched.schedule()
-    assert output.num_scheduled_tokens == {r.request_id: 1 for r in requests}
+    assert output.num_scheduled_tokens == {
+        **{r.request_id: 1 for r in requests},
+        fresh.request_id: 128,
+    }
     assert output.sawtooth_has_decode
-    assert not prefill.sawtooth_has_decode  # immutable admission classification
+    assert sched._sawtooth_prefill_lens[fresh.request_id] == 128
+    sched.schedule()
     assert replace(output).sawtooth_has_decode
 
 
-def test_strict_modes_reject_invalid_combinations_without_scheduling():
-    sched = scheduler()
-    before = sched.current_step
-    sched.sawtooth_decode_only = sched.sawtooth_prefill_only = True
-    with pytest.raises(ValueError, match="exclusive"):
-        sched.schedule()
-    sched.sawtooth_prefill_only = False
-    sched.sawtooth_enabled = False
-    with pytest.raises(ValueError, match="requires sawtooth"):
-        sched.schedule()
-    assert sched.current_step == before
+def test_ready_mixed_batch_skips_pending_decode_successor():
+    sched = scheduler(max_num_seqs=4, max_num_batched_tokens=64, max_model_len=256)
+    pending, ready, prefill = create_requests(3, num_tokens=16, max_tokens=8)
+    for request in (pending, ready):
+        sched.add_request(request)
+    first = sched.schedule()
+    sched.sawtooth_mark_tail_enqueued(first)
+    sched.update_from_output(first, result(first))
+    sched.sawtooth_available_batches = 2
+    predecessor = sched.schedule()
+    assert predecessor.num_scheduled_tokens == {pending.request_id: 1}
+    enable_successor(sched, predecessor)
+    sched.add_request(prefill)
+    sched.sawtooth_defer_dependent_decode = True
+    sched.sawtooth_available_batches = 1
+    output = sched.schedule()
+    assert output.num_scheduled_tokens == {ready.request_id: 1, prefill.request_id: 16}
+    assert pending.num_in_flight_tokens == 1
+    assert output.sawtooth_request_steps[ready.request_id].token_start == 16
+
+
+def test_exhausted_budget_does_not_force_an_extra_prefill():
+    sched = scheduler(max_num_seqs=4, max_num_batched_tokens=64, max_model_len=256)
+    first, second, prefill = create_requests(3, num_tokens=16, max_tokens=8)
+    for request in (first, second):
+        sched.add_request(request)
+    output = sched.schedule()
+    sched.update_from_output(output, result(output))
+    sched.add_request(prefill)
+    sched.max_num_scheduled_tokens = 2
+    sched.sawtooth_available_batches = 1
+    output = sched.schedule()
+    assert output.num_scheduled_tokens == {first.request_id: 1, second.request_id: 1}
+    assert output.sawtooth_has_decode
+    assert prefill.num_computed_tokens == 0
 
 
 @pytest.mark.parametrize("prefill_length", [1, 17])
@@ -459,10 +631,6 @@ def test_new_single_query_prefill_is_not_a_decode_candidate(prefill_length):
         sched.update_from_output(output, result(output))
     sched.add_request(fresh)
     assert not sched.sawtooth_has_decode_candidate()
-    sched.sawtooth_decode_only = True
-    assert not sched.schedule().num_scheduled_tokens
-    sched.sawtooth_decode_only = False
-    sched.sawtooth_prefill_only = True
     prefill = sched.schedule()
     assert prefill.num_scheduled_tokens == {fresh.request_id: 1}
     assert not prefill.sawtooth_has_decode
@@ -493,14 +661,9 @@ def test_chunked_and_replayed_prefill_use_worker_boundary():
     assert request.num_computed_tokens > request.num_prompt_tokens
     assert not sched.sawtooth_has_decode_candidate()
     assert sched.sawtooth_has_prefill_candidate()
-    sched.sawtooth_decode_only = True
-    assert not sched.schedule().num_scheduled_tokens
-    sched.sawtooth_decode_only = False
-    sched.sawtooth_prefill_only = True
     final_prefill = sched.schedule()
     assert final_prefill.total_num_scheduled_tokens == 1
     assert not final_prefill.sawtooth_has_decode
-    sched.sawtooth_prefill_only = False
     enable_successor(sched, final_prefill)
     assert sched.sawtooth_has_decode_candidate()
 
@@ -532,7 +695,6 @@ def test_prefill_opportunity_preserves_full_single_prompt_budget(tmp_path):
     )
     (request,) = create_requests(1, num_tokens=12288, max_tokens=4)
     sched.add_request(request)
-    sched.sawtooth_prefill_only = True
     output = sched.schedule(throttle_prefills=True)
     assert output.num_scheduled_tokens == {request.request_id: 10240}
     assert not output.sawtooth_has_decode

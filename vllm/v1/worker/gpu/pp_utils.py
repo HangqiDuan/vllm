@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pipeline Parallelism utils for V2 Model Runner."""
 
+import os
 from collections import deque
 from dataclasses import dataclass
 
@@ -70,6 +71,12 @@ class PPHandler:
         self.max_sample_len = num_speculative_steps + 1
         self.num_speculative_steps = num_speculative_steps
         self.device = device
+        # Fixed launch configuration must agree on every PP rank. Speculative
+        # mode keeps its existing token/count/draft protocol.
+        self.pack_samples = (
+            os.environ.get("VLLM_ASCEND_PACKED_PP_SAMPLES", "0") == "1"
+            and num_speculative_steps == 0
+        )
         self.main_stream = torch.cuda.current_stream(device)
         self.broadcast_stream = torch.cuda.Stream(device)
 
@@ -186,6 +193,16 @@ class PPHandler:
                 send, src=self.last_rank, group=self.broadcast_group
             )
 
+    def _allocate_sample_packet(
+        self, num_reqs: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Both views own this allocation. Counts are reinterpreted, never
+        # numerically converted; their byte offset is aligned to eight bytes.
+        packet = torch.empty(2 * num_reqs, dtype=torch.int64, device=self.device)
+        tokens = packet[:num_reqs].view(num_reqs, 1)
+        counts = packet[num_reqs:].view(torch.int32).view(2, num_reqs)
+        return packet, tokens, counts
+
     def receive(self, input_batch: InputBatch) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*
         requests in the batch."""
@@ -202,16 +219,26 @@ class PPHandler:
         num_reqs = input_batch.num_reqs
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
-            sampled_tokens = torch.empty(
-                num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
-            )
-            combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
-            torch.distributed.broadcast(
-                sampled_tokens, src=self.last_rank, group=self.broadcast_group
-            )
-            torch.distributed.broadcast(
-                combined, src=self.last_rank, group=self.broadcast_group
-            )
+            if self.pack_samples:
+                packet, sampled_tokens, combined = self._allocate_sample_packet(
+                    num_reqs
+                )
+                torch.distributed.broadcast(
+                    packet, src=self.last_rank, group=self.broadcast_group
+                )
+            else:
+                sampled_tokens = torch.empty(
+                    num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
+                )
+                combined = torch.empty(
+                    2, num_reqs, dtype=torch.int32, device=self.device
+                )
+                torch.distributed.broadcast(
+                    sampled_tokens, src=self.last_rank, group=self.broadcast_group
+                )
+                torch.distributed.broadcast(
+                    combined, src=self.last_rank, group=self.broadcast_group
+                )
             draft_tokens = None
             if self.num_speculative_steps > 0:
                 draft_tokens = torch.empty(
@@ -263,18 +290,30 @@ class PPHandler:
 
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
-            send_tokens = torch.nn.functional.pad(
-                sampled_token_ids,
-                (0, self.max_sample_len - sampled_token_ids.shape[-1]),
-            )
-            torch.distributed.broadcast(
-                send_tokens.contiguous(),
-                src=self.last_rank,
-                group=self.broadcast_group,
-            )
-            combined = torch.stack((num_sampled, num_rejected), dim=0)
-            torch.distributed.broadcast(
-                combined, src=self.last_rank, group=self.broadcast_group
-            )
+            if self.pack_samples:
+                assert num_sampled.dtype == num_rejected.dtype == torch.int32
+                packet, send_tokens, combined = self._allocate_sample_packet(
+                    input_batch.num_reqs
+                )
+                send_tokens.copy_(sampled_token_ids)
+                combined[0].copy_(num_sampled)
+                combined[1].copy_(num_rejected)
+                torch.distributed.broadcast(
+                    packet, src=self.last_rank, group=self.broadcast_group
+                )
+            else:
+                send_tokens = torch.nn.functional.pad(
+                    sampled_token_ids,
+                    (0, self.max_sample_len - sampled_token_ids.shape[-1]),
+                )
+                torch.distributed.broadcast(
+                    send_tokens.contiguous(),
+                    src=self.last_rank,
+                    group=self.broadcast_group,
+                )
+                combined = torch.stack((num_sampled, num_rejected), dim=0)
+                torch.distributed.broadcast(
+                    combined, src=self.last_rank, group=self.broadcast_group
+                )
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)

@@ -117,12 +117,14 @@ class SawtoothTrace:
 
 
 _trace = None
+_schedule_trace = None
 _init_lock = threading.Lock()
 
 
 def _after_fork():
-    global _trace, _init_lock
+    global _trace, _schedule_trace, _init_lock
     _trace = None
+    _schedule_trace = None
     _init_lock = threading.Lock()
 
 
@@ -182,5 +184,80 @@ def command_context(output):
                 for rid, step in steps.items()
             ],
         }
+    except Exception as error:
+        return {"metadata_error": type(error).__name__}
+
+
+def get_sawtooth_schedule_trace():
+    """Enable admission diagnostics without tracing every worker RPC."""
+    global _schedule_trace
+    if _schedule_trace is None:
+        with _init_lock:
+            if _schedule_trace is None:
+                directory = os.environ.get("VLLM_SAWTOOTH_SCHEDULE_TRACE_DIR")
+                _schedule_trace = SawtoothTrace(directory)
+                if _schedule_trace.enabled:
+                    atexit.register(_schedule_trace.close)
+    return _schedule_trace
+
+
+def admission_snapshot(scheduler, request_cap, token_budget, defer_prefills):
+    """Capture CPU admission state before scheduling advances request counters."""
+    try:
+        requests = []
+        for queue, entries in (
+            ("running", scheduler.running),
+            ("kv_waiting", scheduler.kv_holding_waiting),
+            ("waiting", scheduler.waiting),
+        ):
+            for request in entries:
+                if len(requests) >= 256:
+                    break
+                decode = scheduler._sawtooth_is_decode(request, 1)
+                candidate = (
+                    scheduler._sawtooth_running_tokens(request, scheduler.current_step)
+                    if queue == "running"
+                    else None
+                )
+                blockers = []
+                if request.num_in_flight_tokens:
+                    if scheduler.sawtooth_defer_dependent_decode and decode:
+                        blockers.append("dependent_decode")
+                    elif not scheduler.sawtooth_can_schedule(request):
+                        blockers.append("in_flight_ledger")
+                if scheduler.current_step < request.next_decode_eligible_step:
+                    blockers.append("decode_step_cadence")
+                if defer_prefills and request.is_prefill_chunk:
+                    blockers.append("prefill_throttle")
+                if candidate == 0 and not blockers:
+                    blockers.append("no_candidate_tokens_or_lifecycle_guard")
+                requests.append(
+                    dict(
+                        req_id=request.request_id,
+                        queue=queue,
+                        kind="D" if decode else "P",
+                        status=request.status.name,
+                        computed_tokens=request.num_computed_tokens,
+                        prefill_len=scheduler._sawtooth_prefill_lens.get(
+                            request.request_id, request.num_prompt_tokens
+                        ),
+                        in_flight_tokens=request.num_in_flight_tokens,
+                        output_placeholders=request.num_output_placeholders,
+                        candidate_tokens=candidate,
+                        blockers=blockers,
+                    )
+                )
+        return dict(
+            scheduler_step=scheduler.current_step,
+            requests=requests,
+            request_cap=request_cap,
+            token_budget=token_budget,
+            free_batch_slots=scheduler.sawtooth_available_batches,
+            admission_policy="ready_budget",
+            defer_dependent_decode=scheduler.sawtooth_defer_dependent_decode,
+            early_admission=scheduler.sawtooth_allow_early_admission,
+            running_stop=None,
+            waiting_stop=None,
+        )
     except Exception as error:
         return {"metadata_error": type(error).__name__}
