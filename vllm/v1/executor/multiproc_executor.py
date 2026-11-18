@@ -41,7 +41,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     model_parallel_is_initialized,
 )
-from vllm.distributed.sawtooth import is_sawtooth_enabled
+from vllm.distributed.sawtooth import SawtoothConfig, is_sawtooth_enabled
 from vllm.envs import enable_envs_cache
 from vllm.logger import configure_logging, init_logger
 from vllm.platforms import current_platform
@@ -71,7 +71,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
-from vllm.v1.sawtooth import SawtoothRoundSubmitted
+from vllm.v1.sawtooth import SawtoothRoundCompleted, SawtoothRoundSubmitted
 from vllm.v1.sawtooth_trace import TracedOutput, command_context, get_sawtooth_trace
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
@@ -174,6 +174,12 @@ class MultiprocExecutor(Executor):
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
         self._sawtooth_enabled = is_sawtooth_enabled(self.vllm_config)
+        self._sawtooth_round_slots = (
+            self._sawtooth_enabled
+            and SawtoothConfig.from_vllm_config(
+                self.vllm_config
+            ).enable_round_slot_scheduling
+        )
         self._sawtooth_failure: Exception | None = None
         self.failure_callback: FailureCallback | None = None
 
@@ -563,7 +569,12 @@ class MultiprocExecutor(Executor):
                 )
                 if command is not None:
                     for rank, response in enumerate(responses):
-                        if command.is_last_round:
+                        if getattr(self, "_sawtooth_round_slots", False):
+                            valid = (
+                                isinstance(response, SawtoothRoundCompleted)
+                                and response.execution == command
+                            )
+                        elif command.is_last_round:
                             valid = response is None
                         else:
                             valid = (

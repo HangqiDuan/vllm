@@ -10,7 +10,11 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.v1.engine.sawtooth import SawtoothEngine
-from vllm.v1.sawtooth import SawtoothRequestLedger, SawtoothRoundSubmitted
+from vllm.v1.sawtooth import (
+    SawtoothRequestLedger,
+    SawtoothRoundCompleted,
+    SawtoothRoundSubmitted,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -1010,3 +1014,256 @@ def test_dependent_decode_policy_tracks_prefill_candidates(overlap):
         assert engine.step() == ({}, False)
         assert scheduler.sawtooth_defer_dependent_decode == (overlap and available)
     assert not executor.commands
+
+
+class CompletionPending(RuntimeError):
+    """A test-only nonblocking stand-in for an unfinished device fence."""
+
+
+class DeferredRoundFuture(LazyFuture):
+    def __init__(self, queue, response):
+        super().__init__(queue, response)
+        self.ready = False
+
+    def result(self, timeout=None):
+        if not self.ready and not self.done():
+            raise CompletionPending("physical round has not completed")
+        return super().result(timeout)
+
+
+class RoundExecutor(Executor):
+    def __init__(self):
+        super().__init__()
+        self.round_futures = []
+        self.submission_ack_only = False
+        self.fail_command = None
+
+    def execute_model(self, output, non_block):
+        assert non_block
+        self.commands.append(output)
+        command = output.sawtooth_execution
+
+        def response():
+            self.before_response()
+            if command.command_seq == self.fail_command:
+                raise RuntimeError("physical round failed")
+            if self.submission_ack_only:
+                return SawtoothRoundSubmitted(command)
+            return SawtoothRoundCompleted(command)
+
+        future = DeferredRoundFuture(self.responses, response)
+        self.round_futures.append(future)
+        return future
+
+
+def make_round_slot_engine(count=4, capacity=3, rounds=2, overlap=True):
+    initial, scheduler, _ = make_engine(count, capacity, rounds)
+    initial.core.vllm_config.additional_config["sawtooth_pipeline"].update(
+        enable_round_slot_scheduling=True,
+        enable_prefill_chunk_overlap=overlap,
+        enable_prefill_pair_balance=True,
+    )
+    scheduler.sawtooth_request_ledger = SawtoothRequestLedger()
+    scheduler.sawtooth_mark_head_enqueued = lambda output: None
+    executor = RoundExecutor()
+    initial.core.model_executor = executor
+    return SawtoothEngine(initial.core), scheduler, executor
+
+
+def test_round_slots_yield_after_fifo_completion_before_refilling():
+    engine, scheduler, executor = make_round_slot_engine()
+    for _ in range(3):
+        assert engine.step() == (None, True)
+    assert command_order(executor) == [
+        ("request-0", 0),
+        ("request-1", 0),
+        ("request-0", 1),
+    ]
+    assert len(engine.execution_queue) == 3
+    assert len(engine.active) == 2 and len(engine.slots) == 1
+
+    # A submitted command has not finished its physical PP round. Neither
+    # dispatch capacity nor logical-state/KV leases may be freed by that fact.
+    with pytest.raises(CompletionPending):
+        engine.step()
+    assert len(executor.commands) == len(engine.execution_queue) == 3
+    assert scheduler.updates == [] and scheduler.schedule_calls == 2
+
+    executor.round_futures[0].ready = True
+    assert engine.step() == (None, True)
+    assert len(executor.commands) == 3  # Return for EngineCore input draining.
+    assert len(engine.execution_queue) == 2
+    assert len(engine.active) == 2 and len(engine.slots) == 1
+    assert scheduler.updates == []  # G1 completion does not publish KV/output.
+    engine.step()
+    assert command_order(executor)[-1] == ("request-1", 1)
+
+    executor.round_futures[1].ready = True
+    assert engine.step() == (None, True)
+    assert len(executor.commands) == 4
+    engine.step()
+    assert command_order(executor)[-1] == ("request-2", 0)
+    assert len(engine.active) == 3 and not engine.slots
+
+    executor.round_futures[2].ready = True
+    assert engine.step() == ({0: "request-0"}, True)
+    assert len(executor.commands) == 5
+    assert scheduler.updates == ["request-0"]
+    assert len(engine.slots) == 1
+    engine.step()
+    assert command_order(executor) == [
+        ("request-0", 0),
+        ("request-1", 0),
+        ("request-0", 1),
+        ("request-1", 1),
+        ("request-2", 0),
+        ("request-3", 0),
+    ]
+    for _ in range(30):
+        for future in executor.round_futures:
+            future.ready = True
+        if not engine and not scheduler.has_requests():
+            break
+        engine.step()
+        assert len(engine.execution_queue) <= 3
+        assert len(engine.active) + len(engine.slots) == 3
+    assert command_order(executor)[-2:] == [("request-2", 1), ("request-3", 1)]
+    assert scheduler.updates == [f"request-{i}" for i in range(4)]
+    assert not engine and not executor.responses
+
+
+def test_round_slots_allow_new_prefill_at_next_pair_head_after_input_drain():
+    engine, scheduler, executor = make_round_slot_engine(count=2)
+    for _ in range(3):
+        engine.step()
+    executor.round_futures[0].ready = True
+    engine.step()  # Retire first G1, then return to EngineCore.
+    engine.step()  # Submit second G2, preserving the fixed pair.
+    executor.round_futures[1].ready = True
+    assert engine.step() == (None, True)
+    assert scheduler.schedule_calls == 2
+    assert not scheduler.updates  # No final sample is needed to drain input.
+    scheduler.waiting.append("arriving-prefill")
+    pair_heads = []
+    schedule = scheduler.schedule
+
+    def capture_pair_head(throttle):
+        pair_heads.append(scheduler.sawtooth_pair_head)
+        return schedule(throttle)
+
+    scheduler.schedule = capture_pair_head
+    engine.step()
+    assert pair_heads == [True]
+    assert command_order(executor)[-1] == ("arriving-prefill", 0)
+    assert scheduler.sawtooth_defer_dependent_decode is True
+
+
+@pytest.mark.parametrize("failure", ["submission_ack_only", "fail_command"])
+def test_round_slots_reject_ack_or_failure_without_releasing_leases(failure):
+    engine, scheduler, executor = make_round_slot_engine(count=2)
+    for _ in range(3):
+        engine.step()
+    if failure == "submission_ack_only":
+        executor.submission_ack_only = True
+        message = "Mismatched virtual pipeline"
+    else:
+        executor.fail_command = 0
+        message = "physical round failed"
+    executor.round_futures[0].ready = True
+    with pytest.raises(RuntimeError, match=message):
+        engine.step()
+    assert len(engine.execution_queue) == 3
+    assert len(engine.active) == 2 and len(engine.slots) == 1
+    assert len(executor.commands) == 3 and not scheduler.updates
+
+
+@pytest.mark.parametrize("sample_failure", ["exception", "missing_output"])
+def test_round_slots_final_completion_does_not_release_kv_before_valid_sample(
+    sample_failure,
+):
+    engine, scheduler, executor = make_round_slot_engine(count=2)
+
+    def sample_tokens(grammar, non_block):
+        assert non_block
+        output = executor.commands[-1]
+
+        def response():
+            if sample_failure == "exception":
+                raise RuntimeError("sample result failed")
+            return None
+
+        executor.samples.append(output.request_id)
+        return LazyFuture(executor.responses, response)
+
+    executor.sample_tokens = sample_tokens
+    for _ in range(3):
+        engine.step()
+    executor.round_futures[0].ready = True
+    engine.step()
+    engine.step()
+    executor.round_futures[1].ready = True
+    engine.step()
+    # Both G1s have retired, but neither logical-state lease was returned.
+    assert scheduler.updates == [] and len(engine.slots) == 1
+    executor.round_futures[2].ready = True
+    message = "sample result failed" if sample_failure == "exception" else "no result"
+    with pytest.raises(RuntimeError, match=message):
+        engine.step()
+    assert scheduler.updates == [] and len(engine.slots) == 1
+    assert "request-0" in scheduler.requests
+    assert scheduler.requests["request-0"].num_in_flight_tokens == 1
+
+
+@pytest.mark.parametrize(
+    "capacity,rounds,overlap", [(1, 2, True), (2, 2, True), (3, 3, True), (3, 2, False)]
+)
+def test_round_slots_reject_unsafe_or_unsupported_execution_plans(
+    capacity, rounds, overlap
+):
+    with pytest.raises(ValueError, match="Round slot scheduling requires"):
+        make_round_slot_engine(capacity=capacity, rounds=rounds, overlap=overlap)
+
+
+def test_round_slots_default_off_and_flag_is_strict_boolean():
+    from vllm.distributed.sawtooth import SawtoothConfig
+
+    assert SawtoothConfig().enable_round_slot_scheduling is False
+    for value in ("true", "false", 0, 1, None):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            SawtoothConfig(enable_round_slot_scheduling=value)
+
+
+def test_round_slot_completion_is_progress_without_engine_core_idle_backoff():
+    """Run the actual Core hook without importing its device dependencies."""
+    import ast
+    from pathlib import Path
+
+    import vllm.v1.engine as engine_package
+
+    source = Path(next(iter(engine_package.__path__))) / "core.py"
+    tree = ast.parse(source.read_text())
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_process_engine_step"
+    )
+    sleeps = []
+    namespace = {"time": SimpleNamespace(sleep=sleeps.append)}
+    compiled = compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec")
+    exec(compiled, namespace)
+    engine, scheduler, executor = make_round_slot_engine(count=2)
+    for _ in range(3):
+        engine.step()
+    executor.round_futures[0].ready = True
+    post_steps = []
+    core = SimpleNamespace(
+        step_fn=engine.step,
+        scheduler=scheduler,
+        output_queue=SimpleNamespace(put_nowait=lambda output: None),
+        post_step=post_steps.append,
+    )
+    progressed = namespace["_process_engine_step"](core)
+    assert sleeps == []
+    assert progressed is True and post_steps == [True]
+    assert len(executor.commands) == 3  # Yield before the next admission.
+    assert not scheduler.updates and len(engine.slots) == 1

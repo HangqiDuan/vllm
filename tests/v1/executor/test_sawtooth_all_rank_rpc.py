@@ -21,7 +21,11 @@ from vllm.v1.executor.multiproc_executor import (
     _use_async_output,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput
-from vllm.v1.sawtooth import SawtoothExecution, SawtoothRoundSubmitted
+from vllm.v1.sawtooth import (
+    SawtoothExecution,
+    SawtoothRoundCompleted,
+    SawtoothRoundSubmitted,
+)
 
 
 class Queue:
@@ -94,6 +98,46 @@ def test_nonblocking_all_rank_ack_and_final_none():
     assert last.result() is None
     assert first.result() == SawtoothRoundSubmitted(scheduled.sawtooth_execution)
     assert reads == list(range(8)) * 2
+
+
+@pytest.mark.parametrize("final", [False, True])
+def test_round_slots_reject_submission_ack_as_device_completion(final):
+    executor, reads = executor_fixture()
+    executor._sawtooth_round_slots = True
+    scheduled = output(int(final), int(final))
+    future = executor.execute_model(scheduled, non_block=True)
+    values = [None] * 8 if final else acknowledgements(scheduled.sawtooth_execution)
+    responses(executor, values)
+    with pytest.raises(RuntimeError, match="Invalid sawtooth"):
+        future.result()
+    assert reads == list(range(8))
+
+
+@pytest.mark.parametrize("round_id", [0, 1])
+def test_round_slots_require_matching_completion_from_every_rank(round_id):
+    executor, reads = executor_fixture()
+    executor._sawtooth_round_slots = True
+    scheduled = output(round_id, round_id)
+    future = executor.execute_model(scheduled, non_block=True)
+    completed = SawtoothRoundCompleted(scheduled.sawtooth_execution)
+    responses(executor, [completed] * 8)
+    assert future.result() == completed
+    assert reads == list(range(8))
+
+
+@pytest.mark.parametrize("wrong_rank", [0, 5])
+def test_round_slots_reject_one_stale_rank_completion(wrong_rank):
+    executor, reads = executor_fixture()
+    executor._sawtooth_round_slots = True
+    scheduled = output()
+    future = executor.execute_model(scheduled, non_block=True)
+    values = [SawtoothRoundCompleted(scheduled.sawtooth_execution)] * 8
+    values[wrong_rank] = SawtoothRoundCompleted(output(0, 99).sawtooth_execution)
+    responses(executor, values)
+    with pytest.raises(RuntimeError, match="Invalid sawtooth"):
+        future.result()
+    assert executor.is_failed
+    assert reads == list(range(8))
 
 
 def test_sample_selects_physical_output_rank_four_not_seven():

@@ -39,6 +39,13 @@ class SawtoothRoundSubmitted:
 
 
 @dataclass(frozen=True)
+class SawtoothRoundCompleted:
+    """All device work and activation transfers for this round have completed."""
+
+    execution: SawtoothExecution
+
+
+@dataclass(frozen=True)
 class SawtoothRequestStep:
     """Immutable input interval and producer identity, independent of slots."""
 
@@ -101,10 +108,7 @@ class SawtoothRequestLedger:
             # already on every worker FIFO. Only the newest head can be ahead
             # of its tail; this admits its partner without opening a third head
             # before the older pair's tails. Submission never releases KV.
-            and (
-                len(state.live) == 1
-                or state.tail_enqueued >= state.live[-2].step_id
-            )
+            and (len(state.live) == 1 or state.tail_enqueued >= state.live[-2].step_id)
         )
 
     def has_enqueued_final_prefill(self, request_id: str, end: int) -> bool:

@@ -25,6 +25,7 @@ class SawtoothConfig:
     enable_sas_metadata_reuse: bool = False
     enable_prefill_pair_balance: bool = False
     enable_decode_sas_metadata_reuse: bool = False
+    enable_round_slot_scheduling: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -39,6 +40,8 @@ class SawtoothConfig:
             raise ValueError("enable_sas_metadata_reuse must be a boolean")
         if type(self.enable_decode_sas_metadata_reuse) is not bool:
             raise ValueError("enable_decode_sas_metadata_reuse must be a boolean")
+        if type(self.enable_round_slot_scheduling) is not bool:
+            raise ValueError("enable_round_slot_scheduling must be a boolean")
         if type(self.virtual_size) is not int or self.virtual_size < 1:
             raise ValueError("virtual_size must be positive")
         if self.max_live_batches is not None and (
@@ -70,6 +73,7 @@ class SawtoothConfig:
             "enable_sas_metadata_reuse",
             "enable_prefill_pair_balance",
             "enable_decode_sas_metadata_reuse",
+            "enable_round_slot_scheduling",
         }
         if unknown:
             raise ValueError(f"Unknown sawtooth_pipeline options: {sorted(unknown)}")
@@ -99,6 +103,7 @@ class SawtoothConfig:
             raw.get("enable_sas_metadata_reuse", False),
             raw.get("enable_prefill_pair_balance", False),
             raw.get("enable_decode_sas_metadata_reuse", False),
+            raw.get("enable_round_slot_scheduling", False),
         )
 
 

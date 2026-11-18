@@ -7,7 +7,11 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from vllm.distributed.sawtooth import get_sawtooth_plan
-from vllm.v1.sawtooth import SawtoothExecution, SawtoothRoundSubmitted
+from vllm.v1.sawtooth import (
+    SawtoothExecution,
+    SawtoothRoundCompleted,
+    SawtoothRoundSubmitted,
+)
 from vllm.v1.sawtooth_trace import (
     command_context,
     get_sawtooth_schedule_trace,
@@ -44,12 +48,29 @@ class SawtoothEngine:
         if core.is_pooling_model:
             raise ValueError("Sawtooth requires a generation model")
         self.capacity = config.max_concurrent_batches
+        self.round_slot_scheduling = self.plan.config.enable_round_slot_scheduling
+        if self.round_slot_scheduling and not (
+            self.plan.pipeline_size == 2
+            and self.plan.virtual_size == 2
+            and self.plan.config.enable_prefill_chunk_overlap
+            and self.capacity >= 3
+        ):
+            # Two heads need a third entry for the first wrap consumer before
+            # waiting for completion; two entries alone can deadlock HCCL.
+            raise ValueError(
+                "Round slot scheduling requires PP2/V2, prefill chunk overlap "
+                "and at least 3 execution slots"
+            )
         core.scheduler.sawtooth_pipeline_capacity = self.capacity
+        # These leases still protect logical state through terminal sampling.
         self.slots = deque(range(self.capacity))
         self.generations = [0] * self.capacity
         self.active: deque[LogicalBatch] = deque()
         self.rounds: deque[LogicalBatch] = deque()
         self.controls = deque()
+        self.execution_queue: deque[tuple[LogicalBatch, SawtoothExecution, Any]] = (
+            deque()
+        )
         self.next_batch_id = 0
         self.command_seq = 0
         self.phase_limit: int | None = None
@@ -75,6 +96,9 @@ class SawtoothEngine:
                 phase_limit=self.phase_limit,
                 free_slots=len(self.slots),
                 active_batches=len(self.active),
+                free_execution_slots=self.capacity - len(self.execution_queue)
+                if self.round_slot_scheduling
+                else None,
             )
         with self.trace.span("engine.dispatch", context):
             batch.exec_future = self.core.model_executor.execute_model(
@@ -92,6 +116,50 @@ class SawtoothEngine:
             # Every worker receives final execute + sample before a successor's
             # round zero on the same FIFO. This is not a device completion.
             self.core.scheduler.sawtooth_mark_tail_enqueued(batch.scheduler_output)
+        if self.round_slot_scheduling:
+            self.execution_queue.append((batch, command, batch.exec_future))
+
+    def _validate_acknowledgement(self, command, acknowledgement):
+        if self.round_slot_scheduling:
+            valid = (
+                isinstance(acknowledgement, SawtoothRoundCompleted)
+                and acknowledgement.execution == command
+            )
+        else:
+            valid = command.is_last_round or (
+                isinstance(acknowledgement, SawtoothRoundSubmitted)
+                and acknowledgement.execution == command
+            )
+        if not valid:
+            raise RuntimeError("Mismatched virtual pipeline submission/completion")
+
+    def _retire_round(self):
+        batch, command, future = self.execution_queue[0]
+        context = None
+        if self.trace.enabled:
+            context = command_context(
+                replace(batch.scheduler_output, sawtooth_execution=command)
+            )
+            context.update(
+                free_execution_slots=self.capacity - len(self.execution_queue),
+                free_slots=len(self.slots),
+            )
+        with self.trace.span("engine.round_retire_wait", context):
+            acknowledgement = future.result()
+            self._validate_acknowledgement(command, acknowledgement)
+        if command.is_last_round:
+            if not self.active or self.active[0] is not batch:
+                raise RuntimeError("Out-of-order logical batch retirement")
+            # Keep sample publication and logical-state release on the existing
+            # terminal path, even though execution capacity is per round.
+            result = self._retire()
+        else:
+            # Completion is progress; False triggers Core's 1 ms idle backoff.
+            result = (None, True)
+        with self.trace.span("engine.round_retire_commit", context):
+            self.execution_queue.popleft()
+        # Never schedule here: EngineCore must first drain newly arrived input.
+        return result
 
     def _pair_blocks_admission(self):
         if not (
@@ -160,11 +228,7 @@ class SawtoothEngine:
                 if not future.done():
                     continue
                 acknowledgement = future.result()
-                if not command.is_last_round and (
-                    not isinstance(acknowledgement, SawtoothRoundSubmitted)
-                    or acknowledgement.execution != command
-                ):
-                    raise RuntimeError("Mismatched virtual pipeline submission")
+                self._validate_acknowledgement(command, acknowledgement)
         # Reading a later Multiproc future marks older failed futures done,
         # but does not raise their exceptions. Validate completed submissions
         # (including other batches) and controls before publishing KV or tokens.
@@ -244,6 +308,8 @@ class SawtoothEngine:
         return output
 
     def step(self):
+        if self.round_slot_scheduling and len(self.execution_queue) >= self.capacity:
+            return self._retire_round()
         if self.plan.config.enable_prefill_chunk_overlap:
             ledger = self.core.scheduler.sawtooth_request_ledger
             ledger.allow_prefill_overlap = True
@@ -316,6 +382,8 @@ class SawtoothEngine:
             return None, True
 
         if self.active:
+            if self.round_slot_scheduling:
+                return self._retire_round()
             terminal = self.active[0].terminal_future
             if (
                 self.slots
